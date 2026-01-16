@@ -189,6 +189,17 @@ export DRAFT_MODEL_REPO=meta-llama/Llama-2-7b-chat-hf
 python generate.py --compile --checkpoint_path checkpoints/$MODEL_REPO/model.pth --draft_checkpoint_path checkpoints/$DRAFT_MODEL_REPO/model_int8.pth
 ```
 
+You can also run the draft model on a different device (e.g. `cuda:1`) and optionally add weight noise to the draft model after load (useful to simulate lower-precision weights):
+```
+export MODEL_DIR=checkpoints/modelscope/Llama-2-7b-chat-ms
+python generate.py --compile --compile_prefill \
+  --checkpoint_path $MODEL_DIR/model.pth \
+  --draft_checkpoint_path $MODEL_DIR/model.pth \
+  --device cuda:0 --draft_device cuda:1 \
+  --draft_noise_std 1e-3 --draft_noise_seed 1234 \
+  --speculate_k 5 --temperature 0
+```
+
 Note: Running on an A100 80GB, albeit power-limited to 330 watts. Empirically, seems like peak bandwidth is about 1700 GB/s.
 
 
@@ -218,6 +229,22 @@ python quantize.py --mode int4-gptq --calibration_tasks wikitext --calibration_s
 ```
 
 You can then eval or generate text with this model in the same way as above.
+
+## Development Environment Specifications
+
+### Python & Conda Environment
+- **Conda Environment Name**: `gpt-fast`
+- **Active Python Path**: `/home/zhaoyibo/anaconda3/envs/gpt-fast/bin/python`
+- **Execution Rule**: Always use `conda run -n gpt-fast` for any python or pip commands.
+
+### Network & Proxy Configuration
+The server is located in a restricted network environment. **Before any task requiring internet access** (e.g., installing packages, hitting external APIs), you MUST enable the proxy.
+
+- **Proxy Initialization**: 
+    - Since `proxy_on` is a shell function, you must source the profile and execute the command in the same shell session:
+    - Command: `source /etc/profile.d/clash.sh && proxy_on && [YOUR_COMMAND]`
+- **Pre-task Checklist**: If a command fails due to connection timeout or network error, retry with the proxy initialization sequence prefix.
+- **Verification**: You can verify connectivity by running: `source /etc/profile.d/clash.sh && proxy_on && curl -I https://www.google.com`
 
 ## License
 

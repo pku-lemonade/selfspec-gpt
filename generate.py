@@ -15,9 +15,21 @@ import torch._inductor.config
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 def device_sync(device):
-    if "cuda" in device:
-        torch.cuda.synchronize(device)
-    elif ("cpu" in device) or ("mps" in device):
+    if device is None:
+        return
+    if isinstance(device, (list, tuple)):
+        for d in device:
+            device_sync(d)
+        return
+
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    if dev.type == "cuda":
+        # torch.cuda.synchronize accepts either a device index or torch.device.
+        if dev.index is None:
+            torch.cuda.synchronize()
+        else:
+            torch.cuda.synchronize(dev)
+    elif dev.type in ("cpu", "mps"):
         pass
     else:
         print(f"device={device} is not yet suppported")
@@ -97,8 +109,9 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
     return new_tokens, new_probs
 
 
-def model_forward(model, x, input_pos):
-    return model(x, input_pos)
+def model_forward(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
+    mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model.max_seq_length, device=x.device)
+    return model(mask, x, input_pos)
 
 def speculative_decode(
     model: Transformer,
@@ -109,35 +122,45 @@ def speculative_decode(
     **sampling_kwargs
 ) -> torch.Tensor:
     # draft model inference sequentially
-    device = cur_token.device
-    orig_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=cur_token.device)
-    draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
+    target_device = cur_token.device
+    draft_device = draft_model.output.weight.device
+    cur_token_draft = cur_token.to(device=draft_device)
+    orig_input_pos_draft = torch.tensor([input_pos], dtype=torch.int64, device=draft_device)
+    draft_tokens, draft_probs = decode_n_tokens(
+        draft_model,
+        cur_token_draft.view(1, -1),
+        orig_input_pos_draft.clone(),
+        speculate_k,
+        **sampling_kwargs,
+    )
 
-    draft_tokens = torch.cat(draft_tokens)
+    draft_tokens_draft = torch.cat(draft_tokens)
+    draft_tokens = draft_tokens_draft.to(device=target_device)
+    draft_token_ids = draft_tokens.view(-1).to(dtype=torch.long)
     # parallel inference on target model using draft tokens
     target_logits = model_forward(
         model,
-        torch.cat([cur_token.view(1), draft_tokens]).view(1, -1),
-        torch.arange(input_pos, input_pos + speculate_k + 1, device=cur_token.device)
+        torch.cat([cur_token.view(1, 1), draft_tokens], dim=0).view(1, -1),
+        torch.arange(input_pos, input_pos + speculate_k + 1, device=target_device)
     )
     target_probs = logits_to_probs(target_logits[0], **sampling_kwargs)
-    draft_probs = torch.stack(draft_probs)
+    draft_probs = torch.cat(draft_probs, dim=0).to(device=target_device)
     # q: target prob, p: draft prob
     # q >= p: always accept draft token
     # q < p: q/p prob to accept draft token
-    p = draft_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
-    q = target_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
-    accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k]/ p)
+    positions = torch.arange(0, speculate_k, device=target_device)
+    p = draft_probs[positions, draft_token_ids]
+    q = target_probs[positions, draft_token_ids]
+    accept_draft_prob = torch.minimum(torch.ones_like(q), q / p)
     rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
 
     if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
-        accept_length = speculate_k + 1
-        last_token = multinomial_sample_one_no_sync(target_probs[-1])
+        last_token = multinomial_sample_one_no_sync(target_probs[-1].unsqueeze(0))
         # fill last token into draft model
         model_forward(
             draft_model,
-            draft_tokens[-1].view(1, -1),
-            orig_input_pos + speculate_k,
+            draft_tokens_draft[-1].view(1, -1),
+            orig_input_pos_draft + speculate_k,
         )
         return torch.cat([draft_tokens, last_token])
     else:
@@ -147,7 +170,7 @@ def speculative_decode(
         new = q - p
         new = torch.where(new > 0, new, 0.0)
         new = new / new.sum()
-        next_token = multinomial_sample_one_no_sync(new)
+        next_token = multinomial_sample_one_no_sync(new.unsqueeze(0))
         return torch.cat([draft_tokens[:accept_length], next_token])
 
 @torch.no_grad()
@@ -168,6 +191,9 @@ def generate(
     """
 
     is_speculative = draft_model is not None
+    if is_speculative:
+        assert batch_size == 1, "Speculative decoding currently supports batch_size=1"
+        draft_device = draft_model.output.weight.device
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
     T_new = T + max_new_tokens
@@ -181,7 +207,8 @@ def generate(
     with torch.device(device):
         model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
         if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+            with torch.device(draft_device):
+                draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty(batch_size, T_new, dtype=dtype, device=device)
@@ -193,7 +220,9 @@ def generate(
 
     next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
     if is_speculative:
-        prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
+        draft_prompt = prompt.to(device=draft_device)
+        draft_input_pos = input_pos.to(device=draft_device)
+        prefill(draft_model, draft_prompt.view(batch_size, -1), draft_input_pos, **sampling_kwargs)
     seq[:, T] = next_token.squeeze()
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
@@ -210,11 +239,11 @@ def generate(
 
             accept_counts[len(next_tokens) - 1] += 1
             num_added = min(T_new - input_pos - 1, len(next_tokens))
-            seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
+            seq[:, input_pos + 1 : input_pos + num_added + 1] = next_tokens[:num_added].view(1, -1)
             for i in next_tokens[: num_added,]:
                 callback(i)
             input_pos = input_pos + num_added
-            next_token = next_tokens[-1]
+            next_token = next_tokens[num_added - 1]
     else:
         generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
         seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
@@ -262,6 +291,20 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     model = model.to(device=device, dtype=precision)
     return model.eval()
 
+
+@torch.no_grad()
+def add_gaussian_noise_to_model_weights_(model: Transformer, std: float, seed: int) -> None:
+    if std <= 0:
+        return
+    device = model.output.weight.device
+    devices = [device.index] if device.type == "cuda" else None
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        for _, param in model.named_parameters():
+            if not param.is_floating_point():
+                continue
+            param.add_(torch.randn_like(param) * std)
+
 def _get_model_size(model):
     model_size = 0
     params = 0
@@ -296,6 +339,9 @@ def main(
     compile_prefill: bool = False,
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
+    draft_device: Optional[str] = None,
+    draft_noise_std: float = 0.0,
+    draft_noise_seed: int = 1234,
     speculate_k: int = 5,
     device=default_device,
 ) -> None:
@@ -315,21 +361,30 @@ def main(
             # only print on rank 0
             print = lambda *args, **kwargs: None
 
-    print(f"Using device={device}")
     precision = torch.bfloat16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
+    if draft_device is None:
+        draft_device = device
+    sync_devices = [device] if (not is_speculative or draft_device == device) else [device, draft_device]
+
+    print(f"Using device={device}")
+    if is_speculative and draft_device != device:
+        print(f"Using draft_device={draft_device}")
 
     print("Loading model ...")
     t0 = time.time()
     model = _load_model(checkpoint_path, device, precision, use_tp)
 
     if is_speculative:
-        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
+        draft_model = _load_model(draft_checkpoint_path, draft_device, precision, use_tp)
+        if draft_noise_std > 0:
+            print(f"Adding Gaussian noise to draft weights: std={draft_noise_std}, seed={draft_noise_seed}")
+            add_gaussian_noise_to_model_weights_(draft_model, draft_noise_std, draft_noise_seed)
     else:
         draft_model = None
 
-    device_sync(device=device) # MKG
+    device_sync(sync_devices) # MKG
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
@@ -366,7 +421,7 @@ def main(
     start = -1 if compile else 0
 
     for i in range(start, num_samples):
-        device_sync(device=device) # MKG
+        device_sync(sync_devices) # MKG
         if i >= 0 and interactive:
             prompt = input("What is your prompt? ")
             if is_chat:
@@ -419,7 +474,7 @@ def main(
                 prof.export_chrome_trace(f"{profile}_rank_{rank}.json")
             else:
                 prof.export_chrome_trace(f"{profile}.json")
-        device_sync(device=device) # MKG
+        device_sync(sync_devices) # MKG
         t = time.perf_counter() - t0
 
         if not interactive:
@@ -448,7 +503,14 @@ def main(
     print(f"Prompt Length: {prompt_length}")
     print(f"Generated tokens: {max_new_tokens}")
     print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
-    print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+    if "cuda" in device:
+        target_mem = torch.cuda.max_memory_reserved(torch.device(device)) / 1e9
+        if is_speculative and draft_device != device and "cuda" in draft_device:
+            draft_mem = torch.cuda.max_memory_reserved(torch.device(draft_device)) / 1e9
+            print(f"Memory used (target): {target_mem:.02f} GB")
+            print(f"Memory used (draft): {draft_mem:.02f} GB")
+        else:
+            print(f"Memory used: {target_mem:.02f} GB")
 
 
 if __name__ == '__main__':
@@ -474,11 +536,14 @@ if __name__ == '__main__':
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
+    parser.add_argument('--draft_device', type=str, default=None, help='Device for the draft model (defaults to --device).')
+    parser.add_argument('--draft_noise_std', type=float, default=0.0, help='Gaussian noise std to add to draft model weights after load.')
+    parser.add_argument('--draft_noise_seed', type=int, default=1234, help='RNG seed for draft weight noise.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.draft_device, args.draft_noise_std, args.draft_noise_seed, args.speculate_k, args.device
     )
