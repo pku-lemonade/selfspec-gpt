@@ -213,6 +213,8 @@ python generate.py --compile --compile_prefill \
 ```
 If you hit a `CUDA ... illegal memory access` inside `create_block_mask`, add `--no_compile_block_mask`.
 
+To additionally quantize activations per-token and run int8xint8 matmuls for target linear layers, enable `--int8_act_quant`. To apply fake activation quantization to the draft model (still fp matmuls), enable `--draft_fake_act_quant_int8`.
+
 Note: Running on an A100 80GB, albeit power-limited to 330 watts. Empirically, seems like peak bandwidth is about 1700 GB/s.
 
 

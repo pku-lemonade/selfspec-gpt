@@ -260,7 +260,7 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp):
+def _load_model(checkpoint_path, device, precision, use_tp, *, int8_act_quant: bool = False):
     use_cuda = 'cuda' in device
     with torch.device('meta'):
         model = Transformer.from_name(checkpoint_path.parent.name)
@@ -268,7 +268,7 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
         from quantize import WeightOnlyInt8QuantHandler
-        simple_quantizer = WeightOnlyInt8QuantHandler(model)
+        simple_quantizer = WeightOnlyInt8QuantHandler(model, act_quant=bool(int8_act_quant))
         model = simple_quantizer.convert_for_runtime()
 
     if "int4" in str(checkpoint_path):
@@ -448,6 +448,8 @@ def main(
     draft_noise_std: Union[float, Sequence[float]] = 0.0,
     draft_noise_seed: int = 1234,
     draft_dequantize_int8: bool = False,
+    draft_fake_act_quant_int8: bool = False,
+    int8_act_quant: bool = False,
     speculate_k: int = 5,
     attention_backend: str = "flex",
     device=default_device,
@@ -487,13 +489,17 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, use_tp)
+    model = _load_model(checkpoint_path, device, precision, use_tp, int8_act_quant=int8_act_quant)
 
     if is_speculative:
         if draft_dequantize_int8:
             draft_model = _load_int8_weight_only_as_fp_model(draft_checkpoint_path, draft_device, precision, use_tp)
         else:
             draft_model = _load_model(draft_checkpoint_path, draft_device, precision, use_tp)
+        if draft_fake_act_quant_int8:
+            from quantize import replace_linear_fake_act_quant
+
+            replace_linear_fake_act_quant(draft_model)
         ffn_std, qkv_std, out_std = _coerce_draft_noise_stds(draft_noise_std)
         if ffn_std > 0 or qkv_std > 0 or out_std > 0:
             print(
@@ -671,6 +677,16 @@ if __name__ == '__main__':
         help='If set, treat the draft checkpoint as an int8 weight-only checkpoint and dequantize it to fp weights for draft inference.',
     )
     parser.add_argument(
+        '--draft_fake_act_quant_int8',
+        action='store_true',
+        help='If set, apply per-token int8 fake activation quantization to the draft model linears (still runs fp matmuls).',
+    )
+    parser.add_argument(
+        '--int8_act_quant',
+        action='store_true',
+        help='If set (and checkpoint is int8), quantize activations per-token and run int8xint8 matmuls for linear layers (target model).',
+    )
+    parser.add_argument(
         '--draft_noise_std',
         type=float,
         nargs='+',
@@ -691,5 +707,5 @@ if __name__ == '__main__':
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, (not args.no_compile_block_mask), args.profile, args.draft_checkpoint_path,
-        args.draft_device, args.draft_noise_std, args.draft_noise_seed, args.draft_dequantize_int8, args.speculate_k, args.attention_backend, args.device
+        args.draft_device, args.draft_noise_std, args.draft_noise_seed, args.draft_dequantize_int8, args.draft_fake_act_quant_int8, args.int8_act_quant, args.speculate_k, args.attention_backend, args.device
     )

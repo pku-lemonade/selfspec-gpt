@@ -317,8 +317,9 @@ def replace_linear_weight_only_int8_per_channel(module):
             replace_linear_weight_only_int8_per_channel(child)
 
 class WeightOnlyInt8QuantHandler:
-    def __init__(self, mod):
+    def __init__(self, mod, *, act_quant: bool = False):
         self.mod = mod
+        self.act_quant = bool(act_quant)
 
     @torch.no_grad()
     def create_quantized_state_dict(self):
@@ -332,7 +333,10 @@ class WeightOnlyInt8QuantHandler:
         return cur_state_dict
 
     def convert_for_runtime(self):
-        replace_linear_weight_only_int8_per_channel(self.mod)
+        if self.act_quant:
+            replace_linear_weight_only_int8_per_channel_act_quant(self.mod)
+        else:
+            replace_linear_weight_only_int8_per_channel(self.mod)
         return self.mod
 
 
@@ -353,6 +357,88 @@ class WeightOnlyInt8Linear(torch.nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
+
+
+def _quantize_activation_per_row_int8(x: torch.Tensor, *, eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor]:
+    # x: [N, K] float
+    x_f = x.float()
+    absmax = x_f.abs().amax(dim=1, keepdim=True)
+    scale = absmax / 127.0
+    scale = torch.clamp(scale, min=eps)
+    x_int = torch.clamp((x_f / scale).round(), -128, 127).to(torch.int8)
+    return x_int, scale.squeeze(1)
+
+
+def _int_mm_padded(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    # CUDA aten._int_mm requires x.size(0) > 16 (M dimension). Pad rows if needed.
+    n = x.size(0)
+    if x.device.type == "cuda" and n <= 16:
+        pad = 17 - n
+        x = torch.cat([x, torch.zeros(pad, x.size(1), dtype=x.dtype, device=x.device)], dim=0)
+        y = torch.ops.aten._int_mm(x, w)
+        return y[:n]
+    return torch.ops.aten._int_mm(x, w)
+
+
+class WeightOnlyInt8ActQuantLinear(torch.nn.Module):
+    __constants__ = ["in_features", "out_features"]
+    in_features: int
+    out_features: int
+    weight: torch.Tensor
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer("weight", torch.empty((out_features, in_features), dtype=torch.int8))
+        self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        origin_x_size = input.size()
+        x = input.reshape(-1, origin_x_size[-1])
+        x_int8, x_scale = _quantize_activation_per_row_int8(x)
+        y_int32 = _int_mm_padded(x_int8, self.weight.t())
+        y = y_int32.float() * x_scale[:, None] * self.scales.float()[None, :]
+        y = y.reshape(origin_x_size[:-1] + (self.out_features,))
+        return y.to(dtype=input.dtype)
+
+
+def replace_linear_weight_only_int8_per_channel_act_quant(module):
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            setattr(module, name, WeightOnlyInt8ActQuantLinear(child.in_features, child.out_features))
+        else:
+            replace_linear_weight_only_int8_per_channel_act_quant(child)
+
+
+class FakeActQuantLinear(torch.nn.Module):
+    __constants__ = ["in_features", "out_features"]
+    in_features: int
+    out_features: int
+    weight: torch.Tensor
+
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.in_features = int(weight.size(1))
+        self.out_features = int(weight.size(0))
+        self.weight = torch.nn.Parameter(weight)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        origin_x_size = input.size()
+        x = input.reshape(-1, origin_x_size[-1])
+        x_int8, x_scale = _quantize_activation_per_row_int8(x)
+        x_dq = x_int8.float() * x_scale[:, None]
+        x_dq = x_dq.reshape(origin_x_size).to(dtype=input.dtype)
+        return F.linear(x_dq, self.weight)
+
+
+def replace_linear_fake_act_quant(module):
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            setattr(module, name, FakeActQuantLinear(child.weight.detach().to(dtype=child.weight.dtype)))
+        else:
+            replace_linear_fake_act_quant(child)
 
 ##### weight only int4 per channel groupwise quantized code ######
 
