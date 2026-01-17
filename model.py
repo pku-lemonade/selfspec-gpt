@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -16,6 +17,13 @@ from torch.nn.attention.flex_attention import (
     BlockMask,
     flex_attention,
 )
+
+ATTENTION_BACKEND = os.environ.get("GPT_FAST_ATTENTION_BACKEND", "flex").lower()
+
+
+def set_attention_backend(backend: str) -> None:
+    global ATTENTION_BACKEND
+    ATTENTION_BACKEND = (backend or "flex").lower()
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -219,7 +227,31 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
+        if ATTENTION_BACKEND == "flex":
+            y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
+        elif ATTENTION_BACKEND in {"sdpa", "sdp"}:
+            if input_pos is None:
+                raise ValueError("input_pos is required for SDPA attention backend")
+
+            # Restrict to the populated prefix to avoid attending to stale KVCache entries.
+            kv_len = int(input_pos[-1].item()) + 1
+            k = k[:, :, :kv_len]
+            v = v[:, :, :kv_len]
+
+            if self.n_head != self.n_local_heads:
+                if self.n_head % self.n_local_heads != 0:
+                    raise ValueError("n_head must be a multiple of n_local_heads for GQA")
+                repeat = self.n_head // self.n_local_heads
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+
+            kv_pos = torch.arange(kv_len, device=input_pos.device).view(1, -1)
+            q_pos = input_pos.view(-1, 1)
+            # bool mask: True means "mask out"
+            attn_mask = kv_pos > q_pos
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+        else:
+            raise ValueError(f"Unknown attention backend: {ATTENTION_BACKEND}")
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 

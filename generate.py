@@ -7,12 +7,14 @@ import itertools
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Sequence, Tuple, Union
+from typing import Any, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch._dynamo.config
 import torch._inductor.config
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask as _create_block_mask
+
+create_block_mask = _create_block_mask
 
 def device_sync(device):
     if device is None:
@@ -43,13 +45,12 @@ torch._functorch.config.enable_autograd_cache = True
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-create_block_mask = torch.compile(create_block_mask)
-
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from model import Transformer
+from model import set_attention_backend
 from tokenizer import get_tokenizer
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
@@ -291,6 +292,55 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     model = model.to(device=device, dtype=precision)
     return model.eval()
 
+def _dequantize_int8_weight_only_state_dict(
+    state_dict: Mapping[str, Any],
+    *,
+    dtype: torch.dtype,
+) -> dict:
+    # gpt-fast int8 checkpoints store per-channel symmetric int8 weights and per-row scales:
+    #   <fqn>.weight  (int8) and <fqn>.scales (bf16)
+    # Runtime computes: y = linear(x, int8_weight) * scales
+    # Equivalent float weight: weight_fp = int8_weight * scales[:, None]
+    out = dict(state_dict)
+    scale_keys = [k for k in out.keys() if k.endswith(".scales")]
+    for scales_key in scale_keys:
+        weight_key = scales_key[: -len(".scales")] + ".weight"
+        if weight_key not in out:
+            continue
+        weight = out[weight_key]
+        scales = out[scales_key]
+        if not isinstance(weight, torch.Tensor) or not isinstance(scales, torch.Tensor):
+            continue
+        if weight.dtype is not torch.int8:
+            continue
+        if scales.dim() != 1:
+            continue
+        # Dequantize to float weights expected by the fp model.
+        weight_fp = weight.to(dtype=dtype) * scales.to(dtype=dtype).unsqueeze(1)
+        out[weight_key] = weight_fp
+        # Remove int8-only aux tensor for fp model.
+        out.pop(scales_key, None)
+    return out
+
+
+def _load_int8_weight_only_as_fp_model(checkpoint_path: Path, device, precision, use_tp):
+    with torch.device("meta"):
+        model = Transformer.from_name(checkpoint_path.parent.name)
+
+    checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
+    if "model" in checkpoint and "stories" in str(checkpoint_path):
+        checkpoint = checkpoint["model"]
+    checkpoint = _dequantize_int8_weight_only_state_dict(checkpoint, dtype=precision)
+    model.load_state_dict(checkpoint, assign=True)
+
+    if use_tp:
+        from tp import apply_tp
+        print("Applying tensor parallel to model ...")
+        apply_tp(model)
+
+    model = model.to(device=device, dtype=precision)
+    return model.eval()
+
 
 @torch.no_grad()
 def add_gaussian_noise_to_model_weights_(model: Transformer, std: float, seed: int) -> None:
@@ -391,12 +441,15 @@ def main(
     checkpoint_path: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
     compile: bool = True,
     compile_prefill: bool = False,
+    compile_block_mask: bool = True,
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     draft_device: Optional[str] = None,
     draft_noise_std: Union[float, Sequence[float]] = 0.0,
     draft_noise_seed: int = 1234,
+    draft_dequantize_int8: bool = False,
     speculate_k: int = 5,
+    attention_backend: str = "flex",
     device=default_device,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
@@ -426,12 +479,21 @@ def main(
     if is_speculative and draft_device != device:
         print(f"Using draft_device={draft_device}")
 
+    set_attention_backend(attention_backend)
+
+    global create_block_mask
+    if compile_block_mask:
+        create_block_mask = torch.compile(_create_block_mask)
+
     print("Loading model ...")
     t0 = time.time()
     model = _load_model(checkpoint_path, device, precision, use_tp)
 
     if is_speculative:
-        draft_model = _load_model(draft_checkpoint_path, draft_device, precision, use_tp)
+        if draft_dequantize_int8:
+            draft_model = _load_int8_weight_only_as_fp_model(draft_checkpoint_path, draft_device, precision, use_tp)
+        else:
+            draft_model = _load_model(draft_checkpoint_path, draft_device, precision, use_tp)
         ffn_std, qkv_std, out_std = _coerce_draft_noise_stds(draft_noise_std)
         if ffn_std > 0 or qkv_std > 0 or out_std > 0:
             print(
@@ -594,10 +656,20 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
+    parser.add_argument(
+        '--no_compile_block_mask',
+        action='store_true',
+        help='Disable torch.compile for create_block_mask (stability fallback).',
+    )
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--draft_device', type=str, default=None, help='Device for the draft model (defaults to --device).')
+    parser.add_argument(
+        '--draft_dequantize_int8',
+        action='store_true',
+        help='If set, treat the draft checkpoint as an int8 weight-only checkpoint and dequantize it to fp weights for draft inference.',
+    )
     parser.add_argument(
         '--draft_noise_std',
         type=float,
@@ -606,11 +678,18 @@ if __name__ == '__main__':
         help='Gaussian noise std(s) to add to draft model weights after load. Provide 1 value (all) or 3 values: FFN QKV OUT.',
     )
     parser.add_argument('--draft_noise_seed', type=int, default=1234, help='RNG seed for draft weight noise.')
+    parser.add_argument(
+        '--attention_backend',
+        type=str,
+        choices=['flex', 'sdpa'],
+        default='flex',
+        help='Attention backend to use. Use sdpa as a stability fallback if flex_attention crashes.',
+    )
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.draft_device, args.draft_noise_std, args.draft_noise_seed, args.speculate_k, args.device
+        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, (not args.no_compile_block_mask), args.profile, args.draft_checkpoint_path,
+        args.draft_device, args.draft_noise_std, args.draft_noise_seed, args.draft_dequantize_int8, args.speculate_k, args.attention_backend, args.device
     )

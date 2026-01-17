@@ -200,6 +200,19 @@ python generate.py --compile --compile_prefill \
   --speculate_k 5 --temperature 0
 ```
 
+To use an INT8 weight-only target model but run the draft model in fp using dequantized INT8 weights (and optional noise), pass an INT8 checkpoint for both and enable `--draft_dequantize_int8`:
+```
+export MODEL_DIR=checkpoints/modelscope/Llama-2-7b-chat-ms
+python generate.py --compile --compile_prefill \
+  --checkpoint_path $MODEL_DIR/model_int8.pth \
+  --draft_checkpoint_path $MODEL_DIR/model_int8.pth \
+  --draft_dequantize_int8 \
+  --device cuda:0 --draft_device cuda:1 \
+  --draft_noise_std 1e-3 0 0 --draft_noise_seed 1234 \
+  --speculate_k 5 --temperature 0
+```
+If you hit a `CUDA ... illegal memory access` inside `create_block_mask`, add `--no_compile_block_mask`.
+
 Note: Running on an A100 80GB, albeit power-limited to 330 watts. Empirically, seems like peak bandwidth is about 1700 GB/s.
 
 

@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import generate as g
+import model as model_lib
 from tokenizer import get_tokenizer
 
 
@@ -95,6 +96,11 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default="cuda:0", help="Target device.")
     parser.add_argument("--draft_device", type=str, default="cuda:1", help="Draft device.")
+    parser.add_argument(
+        "--draft_dequantize_int8",
+        action="store_true",
+        help="If set, load the draft from an int8 weight-only checkpoint but dequantize to fp weights for draft inference.",
+    )
     parser.add_argument("--speculate_k", type=int, default=5, help="Speculative depth (k).")
     parser.add_argument("--prompt", type=str, default="Hi my name is", help="Prompt text.")
     parser.add_argument("--max_new_tokens", type=int, default=200, help="Tokens to generate per run.")
@@ -116,9 +122,24 @@ def main() -> None:
     )
     parser.add_argument("--draft_noise_seed", type=int, default=1234, help="Base seed for draft weight noise.")
     parser.add_argument("--sample_seed", type=int, default=2026, help="Base seed for sampling/acceptance RNG.")
+    parser.add_argument(
+        "--min_mean_accepted",
+        type=float,
+        default=3.0,
+        help="Minimum mean accepted draft tokens (out of k) considered 'not too bad'.",
+    )
+    parser.add_argument(
+        "--attention_backend",
+        type=str,
+        choices=["flex", "sdpa"],
+        default="flex",
+        help="Attention backend to use. Use sdpa as a stability fallback if flex_attention crashes.",
+    )
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (recommended).")
     parser.add_argument("--compile_prefill", action="store_true", help="Also compile prefill (slower compile, faster prefill).")
     args = parser.parse_args()
+
+    model_lib.set_attention_backend(args.attention_backend)
 
     checkpoint_path: Path = args.checkpoint_path
     assert checkpoint_path.is_file(), str(checkpoint_path)
@@ -135,7 +156,10 @@ def main() -> None:
     print(f"Loading target model on {args.device} ...")
     model = g._load_model(checkpoint_path, args.device, precision, use_tp=False)
     print(f"Loading draft model on {args.draft_device} ...")
-    draft_model = g._load_model(checkpoint_path, args.draft_device, precision, use_tp=False)
+    if args.draft_dequantize_int8:
+        draft_model = g._load_int8_weight_only_as_fp_model(checkpoint_path, args.draft_device, precision, use_tp=False)
+    else:
+        draft_model = g._load_model(checkpoint_path, args.draft_device, precision, use_tp=False)
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
     encoded = g.encode_tokens(tokenizer, args.prompt, bos=True, device=args.device)
@@ -240,21 +264,21 @@ def main() -> None:
         tok_s_mean = sum(tok_s_runs) / len(tok_s_runs)
         _, mean_accepted, _ = _aggregate_accept(accept_runs)
         speedup = tok_s_mean / max(baseline, 1e-9)
-        ok = speedup >= 1.0
+        ok = mean_accepted >= float(args.min_mean_accepted)
         if ok:
             best_noise_std = noise_std
         results.append((noise_std, tok_s_mean, speedup, mean_accepted))
 
-        status = "OK" if ok else "SLOW"
+        status = "OK" if ok else "LOW_ACCEPT"
         print(
             f"noise_std={noise_std:.6g}  tok/s={tok_s_mean:7.2f}  speedup={speedup:5.2f}  mean_accepted={mean_accepted:4.2f}  {status}"
         )
 
     print()
     if best_noise_std is None:
-        print("Max acceptable noise_std (speedup>=1.0): NONE (even noise_std=0 was slower than baseline)")
+        print(f"Max acceptable noise_std (mean_accepted>={args.min_mean_accepted:.2f}): NONE")
     else:
-        print(f"Max acceptable noise_std (speedup>=1.0): {best_noise_std:.6g}")
+        print(f"Max acceptable noise_std (mean_accepted>={args.min_mean_accepted:.2f}): {best_noise_std:.6g}")
 
 
 if __name__ == "__main__":
