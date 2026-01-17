@@ -7,7 +7,7 @@ import itertools
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 import torch._dynamo.config
@@ -305,6 +305,60 @@ def add_gaussian_noise_to_model_weights_(model: Transformer, std: float, seed: i
                 continue
             param.add_(torch.randn_like(param) * std)
 
+
+def _coerce_draft_noise_stds(draft_noise_std: Union[float, Sequence[float]]) -> Tuple[float, float, float]:
+    if isinstance(draft_noise_std, (int, float)):
+        v = float(draft_noise_std)
+        return v, v, v
+    if isinstance(draft_noise_std, (list, tuple)):
+        if len(draft_noise_std) == 1:
+            v = float(draft_noise_std[0])
+            return v, v, v
+        if len(draft_noise_std) == 3:
+            return float(draft_noise_std[0]), float(draft_noise_std[1]), float(draft_noise_std[2])
+    raise ValueError("draft_noise_std must be 1 value or 3 values: FFN QKV OUT")
+
+
+@torch.no_grad()
+def add_gaussian_noise_to_draft_weights_(
+    model: Transformer,
+    *,
+    ffn_std: float,
+    qkv_std: float,
+    out_std: float,
+    seed: int,
+) -> dict:
+    counts = {"ffn": 0, "qkv": 0, "out": 0}
+    if ffn_std <= 0 and qkv_std <= 0 and out_std <= 0:
+        return counts
+
+    device = model.output.weight.device
+    devices = [device.index] if device.type == "cuda" else None
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        for name, param in model.named_parameters():
+            if not param.is_floating_point():
+                continue
+            std = 0.0
+            bucket = None
+
+            if name.endswith(".feed_forward.w1.weight") or name.endswith(".feed_forward.w2.weight") or name.endswith(".feed_forward.w3.weight"):
+                std = ffn_std
+                bucket = "ffn"
+            elif name.endswith(".attention.wqkv.weight"):
+                std = qkv_std
+                bucket = "qkv"
+            elif name.endswith(".attention.wo.weight") or name == "output.weight":
+                std = out_std
+                bucket = "out"
+
+            if std <= 0:
+                continue
+
+            param.add_(torch.randn_like(param) * std)
+            counts[bucket] += param.numel()
+    return counts
+
 def _get_model_size(model):
     model_size = 0
     params = 0
@@ -340,7 +394,7 @@ def main(
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     draft_device: Optional[str] = None,
-    draft_noise_std: float = 0.0,
+    draft_noise_std: Union[float, Sequence[float]] = 0.0,
     draft_noise_seed: int = 1234,
     speculate_k: int = 5,
     device=default_device,
@@ -378,9 +432,16 @@ def main(
 
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, draft_device, precision, use_tp)
-        if draft_noise_std > 0:
-            print(f"Adding Gaussian noise to draft weights: std={draft_noise_std}, seed={draft_noise_seed}")
-            add_gaussian_noise_to_model_weights_(draft_model, draft_noise_std, draft_noise_seed)
+        ffn_std, qkv_std, out_std = _coerce_draft_noise_stds(draft_noise_std)
+        if ffn_std > 0 or qkv_std > 0 or out_std > 0:
+            print(
+                "Adding Gaussian noise to draft weights: "
+                f"ffn_std={ffn_std}, qkv_std={qkv_std}, out_std={out_std}, seed={draft_noise_seed}"
+            )
+            counts = add_gaussian_noise_to_draft_weights_(
+                draft_model, ffn_std=ffn_std, qkv_std=qkv_std, out_std=out_std, seed=draft_noise_seed
+            )
+            print(f"Noised params (numel): ffn={counts['ffn']}, qkv={counts['qkv']}, out={counts['out']}")
     else:
         draft_model = None
 
@@ -537,7 +598,13 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--draft_device', type=str, default=None, help='Device for the draft model (defaults to --device).')
-    parser.add_argument('--draft_noise_std', type=float, default=0.0, help='Gaussian noise std to add to draft model weights after load.')
+    parser.add_argument(
+        '--draft_noise_std',
+        type=float,
+        nargs='+',
+        default=[0.0],
+        help='Gaussian noise std(s) to add to draft model weights after load. Provide 1 value (all) or 3 values: FFN QKV OUT.',
+    )
     parser.add_argument('--draft_noise_seed', type=int, default=1234, help='RNG seed for draft weight noise.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 

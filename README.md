@@ -189,14 +189,14 @@ export DRAFT_MODEL_REPO=meta-llama/Llama-2-7b-chat-hf
 python generate.py --compile --checkpoint_path checkpoints/$MODEL_REPO/model.pth --draft_checkpoint_path checkpoints/$DRAFT_MODEL_REPO/model_int8.pth
 ```
 
-You can also run the draft model on a different device (e.g. `cuda:1`) and optionally add weight noise to the draft model after load (useful to simulate lower-precision weights):
+You can also run the draft model on a different device (e.g. `cuda:1`) and optionally add per-component weight noise to the draft model after load (FFN / QKV / output projections):
 ```
 export MODEL_DIR=checkpoints/modelscope/Llama-2-7b-chat-ms
 python generate.py --compile --compile_prefill \
   --checkpoint_path $MODEL_DIR/model.pth \
   --draft_checkpoint_path $MODEL_DIR/model.pth \
   --device cuda:0 --draft_device cuda:1 \
-  --draft_noise_std 1e-3 --draft_noise_seed 1234 \
+  --draft_noise_std 1e-3 1e-3 1e-3 --draft_noise_seed 1234 \
   --speculate_k 5 --temperature 0
 ```
 
