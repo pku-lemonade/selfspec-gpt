@@ -354,9 +354,13 @@ class WeightOnlyInt8Linear(torch.nn.Module):
         self.out_features = out_features
         self.register_buffer("weight", torch.empty((out_features, in_features), dtype=torch.int8))
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
+        self.output_quant_bits = 0
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
+        out = F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
+        if self.output_quant_bits:
+            out = fake_quantize_per_token_symmetric(out, bits=int(self.output_quant_bits))
+        return out
 
 
 def _quantize_activation_per_row_int8(x: torch.Tensor, *, eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor]:
@@ -393,6 +397,7 @@ class WeightOnlyInt8ActQuantLinear(torch.nn.Module):
         self.out_features = out_features
         self.register_buffer("weight", torch.empty((out_features, in_features), dtype=torch.int8))
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
+        self.output_quant_bits = 0
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         origin_x_size = input.size()
@@ -401,7 +406,10 @@ class WeightOnlyInt8ActQuantLinear(torch.nn.Module):
         y_int32 = _int_mm_padded(x_int8, self.weight.t())
         y = y_int32.float() * x_scale[:, None] * self.scales.float()[None, :]
         y = y.reshape(origin_x_size[:-1] + (self.out_features,))
-        return y.to(dtype=input.dtype)
+        y = y.to(dtype=input.dtype)
+        if self.output_quant_bits:
+            y = fake_quantize_per_token_symmetric(y, bits=int(self.output_quant_bits))
+        return y
 
 
 def replace_linear_weight_only_int8_per_channel_act_quant(module):
@@ -423,6 +431,7 @@ class FakeActQuantLinear(torch.nn.Module):
         self.in_features = int(weight.size(1))
         self.out_features = int(weight.size(0))
         self.weight = torch.nn.Parameter(weight)
+        self.output_quant_bits = 0
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         origin_x_size = input.size()
@@ -430,7 +439,10 @@ class FakeActQuantLinear(torch.nn.Module):
         x_int8, x_scale = _quantize_activation_per_row_int8(x)
         x_dq = x_int8.float() * x_scale[:, None]
         x_dq = x_dq.reshape(origin_x_size).to(dtype=input.dtype)
-        return F.linear(x_dq, self.weight)
+        out = F.linear(x_dq, self.weight)
+        if self.output_quant_bits:
+            out = fake_quantize_per_token_symmetric(out, bits=int(self.output_quant_bits))
+        return out
 
 
 def replace_linear_fake_act_quant(module):
@@ -439,6 +451,41 @@ def replace_linear_fake_act_quant(module):
             setattr(module, name, FakeActQuantLinear(child.weight.detach().to(dtype=child.weight.dtype)))
         else:
             replace_linear_fake_act_quant(child)
+
+
+def fake_quantize_per_token_symmetric(x: torch.Tensor, *, bits: int, eps: float = 1e-8) -> torch.Tensor:
+    if bits <= 0:
+        return x
+    if not x.is_floating_point():
+        return x
+    if bits not in (8, 16):
+        raise ValueError("bits must be one of: 0, 8, 16")
+
+    qmin = -(1 << (bits - 1))
+    qmax = (1 << (bits - 1)) - 1
+
+    origin = x.size()
+    if x.numel() == 0:
+        return x
+    x2 = x.reshape(-1, origin[-1]).float()
+    absmax = x2.abs().amax(dim=1, keepdim=True)
+    scale = absmax / float(qmax)
+    scale = torch.clamp(scale, min=eps)
+    q = torch.clamp((x2 / scale).round(), qmin, qmax)
+    y = (q * scale).reshape(origin)
+    return y.to(dtype=x.dtype)
+
+
+def set_post_matmul_output_quant_bits(module: torch.nn.Module, bits: int) -> None:
+    bits = int(bits)
+    if bits == 0:
+        return
+    if bits not in (8, 16):
+        raise ValueError("post-matmul quantization bits must be one of: 0, 8, 16")
+
+    for child in module.modules():
+        if hasattr(child, "output_quant_bits"):
+            child.output_quant_bits = bits
 
 ##### weight only int4 per channel groupwise quantized code ######
 

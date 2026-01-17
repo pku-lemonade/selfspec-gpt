@@ -12,7 +12,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import generate as g
 import model as model_lib
-from quantize import replace_linear_fake_act_quant
+from quantize import replace_linear_fake_act_quant, set_post_matmul_output_quant_bits
 from tokenizer import get_tokenizer
 
 
@@ -112,6 +112,18 @@ def main() -> None:
         action="store_true",
         help="If set, apply per-token int8 fake activation quantization to the draft model linears (still runs fp matmuls).",
     )
+    parser.add_argument(
+        "--post_matmul_quant_bits",
+        type=int,
+        default=0,
+        help="If non-zero, fake-quantize the output of each linear matmul per token to this many bits (supported: 8, 16).",
+    )
+    parser.add_argument(
+        "--draft_post_matmul_quant_bits",
+        type=int,
+        default=0,
+        help="Same as --post_matmul_quant_bits but applied to the draft model.",
+    )
     parser.add_argument("--speculate_k", type=int, default=5, help="Speculative depth (k).")
     parser.add_argument("--prompt", type=str, default="Hi my name is", help="Prompt text.")
     parser.add_argument("--max_new_tokens", type=int, default=200, help="Tokens to generate per run.")
@@ -166,6 +178,8 @@ def main() -> None:
     precision = torch.bfloat16
     print(f"Loading target model on {args.device} ...")
     model = g._load_model(checkpoint_path, args.device, precision, use_tp=False, int8_act_quant=bool(args.int8_act_quant))
+    if args.post_matmul_quant_bits:
+        set_post_matmul_output_quant_bits(model, int(args.post_matmul_quant_bits))
     print(f"Loading draft model on {args.draft_device} ...")
     if args.draft_dequantize_int8:
         draft_model = g._load_int8_weight_only_as_fp_model(checkpoint_path, args.draft_device, precision, use_tp=False)
@@ -173,6 +187,8 @@ def main() -> None:
         draft_model = g._load_model(checkpoint_path, args.draft_device, precision, use_tp=False)
     if args.draft_fake_act_quant_int8:
         replace_linear_fake_act_quant(draft_model)
+    if args.draft_post_matmul_quant_bits:
+        set_post_matmul_output_quant_bits(draft_model, int(args.draft_post_matmul_quant_bits))
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
     encoded = g.encode_tokens(tokenizer, args.prompt, bos=True, device=args.device)

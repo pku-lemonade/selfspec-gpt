@@ -450,6 +450,8 @@ def main(
     draft_dequantize_int8: bool = False,
     draft_fake_act_quant_int8: bool = False,
     int8_act_quant: bool = False,
+    post_matmul_quant_bits: int = 0,
+    draft_post_matmul_quant_bits: int = 0,
     speculate_k: int = 5,
     attention_backend: str = "flex",
     device=default_device,
@@ -491,6 +493,11 @@ def main(
     t0 = time.time()
     model = _load_model(checkpoint_path, device, precision, use_tp, int8_act_quant=int8_act_quant)
 
+    if post_matmul_quant_bits:
+        from quantize import set_post_matmul_output_quant_bits
+
+        set_post_matmul_output_quant_bits(model, post_matmul_quant_bits)
+
     if is_speculative:
         if draft_dequantize_int8:
             draft_model = _load_int8_weight_only_as_fp_model(draft_checkpoint_path, draft_device, precision, use_tp)
@@ -510,6 +517,11 @@ def main(
                 draft_model, ffn_std=ffn_std, qkv_std=qkv_std, out_std=out_std, seed=draft_noise_seed
             )
             print(f"Noised params (numel): ffn={counts['ffn']}, qkv={counts['qkv']}, out={counts['out']}")
+
+        if draft_post_matmul_quant_bits:
+            from quantize import set_post_matmul_output_quant_bits
+
+            set_post_matmul_output_quant_bits(draft_model, draft_post_matmul_quant_bits)
     else:
         draft_model = None
 
@@ -687,6 +699,18 @@ if __name__ == '__main__':
         help='If set (and checkpoint is int8), quantize activations per-token and run int8xint8 matmuls for linear layers (target model).',
     )
     parser.add_argument(
+        '--post_matmul_quant_bits',
+        type=int,
+        default=0,
+        help='If non-zero, fake-quantize the output of each linear matmul per token to this many bits (supported: 8, 16).',
+    )
+    parser.add_argument(
+        '--draft_post_matmul_quant_bits',
+        type=int,
+        default=0,
+        help='Same as --post_matmul_quant_bits but applied to the draft model.',
+    )
+    parser.add_argument(
         '--draft_noise_std',
         type=float,
         nargs='+',
@@ -707,5 +731,15 @@ if __name__ == '__main__':
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, (not args.no_compile_block_mask), args.profile, args.draft_checkpoint_path,
-        args.draft_device, args.draft_noise_std, args.draft_noise_seed, args.draft_dequantize_int8, args.draft_fake_act_quant_int8, args.int8_act_quant, args.speculate_k, args.attention_backend, args.device
+        args.draft_device,
+        args.draft_noise_std,
+        args.draft_noise_seed,
+        args.draft_dequantize_int8,
+        args.draft_fake_act_quant_int8,
+        args.int8_act_quant,
+        args.post_matmul_quant_bits,
+        args.draft_post_matmul_quant_bits,
+        args.speculate_k,
+        args.attention_backend,
+        args.device,
     )
