@@ -13,6 +13,7 @@ out
 !data/shakespeare/prepare.py
 wandb
 .cache
+datasets
 
 # downloaded by our tests
 original_model.py
