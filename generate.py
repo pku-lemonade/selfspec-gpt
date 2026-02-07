@@ -50,7 +50,7 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from model import Transformer
-from model import ModelArgs, set_attention_backend
+from model import ModelArgs, set_attention_backend, set_read_noise_std
 from tokenizer import get_tokenizer, resolve_tokenizer_path
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
@@ -453,6 +453,7 @@ def main(
     post_matmul_quant_bits: int = 0,
     draft_post_matmul_quant_bits: int = 0,
     speculate_k: int = 5,
+    read_noise_std: float = 0.0,
     attention_backend: str = "flex",
     device=default_device,
 ) -> None:
@@ -484,6 +485,9 @@ def main(
         print(f"Using draft_device={draft_device}")
 
     set_attention_backend(attention_backend)
+    set_read_noise_std(read_noise_std)
+    if read_noise_std > 0:
+        print(f"Enabling per-matmul read noise: std={read_noise_std}")
 
     global create_block_mask
     if compile_block_mask:
@@ -719,6 +723,12 @@ if __name__ == '__main__':
     )
     parser.add_argument('--draft_noise_seed', type=int, default=1234, help='RNG seed for draft weight noise.')
     parser.add_argument(
+        '--read_noise_std',
+        type=float,
+        default=0.0,
+        help='Per-matmul Gaussian read-noise std for stationary fp weights. 0 disables runtime read noise.',
+    )
+    parser.add_argument(
         '--attention_backend',
         type=str,
         choices=['flex', 'sdpa'],
@@ -740,6 +750,7 @@ if __name__ == '__main__':
         args.post_matmul_quant_bits,
         args.draft_post_matmul_quant_bits,
         args.speculate_k,
+        args.read_noise_std,
         args.attention_backend,
         args.device,
     )

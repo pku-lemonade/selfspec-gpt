@@ -164,11 +164,20 @@ def main() -> None:
         default="flex",
         help="Attention backend to use. Use sdpa as a stability fallback if flex_attention crashes.",
     )
+    parser.add_argument(
+        "--read_noise_std",
+        type=float,
+        default=0.0,
+        help="Per-matmul Gaussian read-noise std for stationary fp weights. 0 disables runtime read noise.",
+    )
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (recommended).")
     parser.add_argument("--compile_prefill", action="store_true", help="Also compile prefill (slower compile, faster prefill).")
     args = parser.parse_args()
 
     model_lib.set_attention_backend(args.attention_backend)
+    model_lib.set_read_noise_std(args.read_noise_std)
+    if args.read_noise_std > 0:
+        print(f"Enabling per-matmul read noise: std={args.read_noise_std}")
 
     checkpoint_path: Path = args.checkpoint_path
     draft_checkpoint_path: Path = args.draft_checkpoint_path or checkpoint_path

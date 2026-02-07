@@ -21,11 +21,21 @@ from torch.nn.attention.flex_attention import (
 )
 
 ATTENTION_BACKEND = os.environ.get("GPT_FAST_ATTENTION_BACKEND", "flex").lower()
+READ_NOISE_STD = float(os.environ.get("GPT_FAST_READ_NOISE_STD", "0") or "0")
 
 
 def set_attention_backend(backend: str) -> None:
     global ATTENTION_BACKEND
     ATTENTION_BACKEND = (backend or "flex").lower()
+
+
+def set_read_noise_std(std: float) -> None:
+    global READ_NOISE_STD
+    READ_NOISE_STD = max(0.0, float(std))
+
+
+def get_read_noise_std() -> float:
+    return float(READ_NOISE_STD)
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -39,6 +49,19 @@ def get_mask_mod(mask_mod: _mask_mod_signature, offset: int):
         return mask_mod(b, h, q + offset, kv)
 
     return _mask_mod
+
+
+def linear_with_read_noise(linear: nn.Module, x: Tensor) -> Tensor:
+    if READ_NOISE_STD <= 0:
+        return linear(x)
+    # Only apply read noise to standard floating-point stationary weights.
+    if not isinstance(linear, nn.Linear):
+        return linear(x)
+    weight = linear.weight
+    if not weight.is_floating_point():
+        return linear(x)
+    noisy_weight = weight + torch.randn_like(weight) * READ_NOISE_STD
+    return F.linear(x, noisy_weight, linear.bias)
 
 
 @dataclass
@@ -235,7 +258,7 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
         x = self.norm(x)
-        logits = self.output(x)
+        logits = linear_with_read_noise(self.output, x)
         return logits
 
     @classmethod
@@ -288,7 +311,7 @@ class Attention(nn.Module):
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: BlockMask, input_pos: Optional[Tensor] = None) -> Tensor:
         bsz, seqlen, _ = x.shape
 
-        q, k, v = self.wqkv(x).split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        q, k, v = linear_with_read_noise(self.wqkv, x).split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -333,7 +356,7 @@ class Attention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.q_dim)
 
-        y = self.wo(y)
+        y = linear_with_read_noise(self.wo, y)
         return y
 
 
@@ -345,7 +368,7 @@ class FeedForward(nn.Module):
         self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return linear_with_read_noise(self.w2, F.silu(linear_with_read_noise(self.w1, x)) * linear_with_read_noise(self.w3, x))
 
 
 class RMSNorm(nn.Module):
