@@ -13,7 +13,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import generate as g
 import model as model_lib
 from quantize import replace_linear_fake_act_quant, set_post_matmul_output_quant_bits
-from tokenizer import get_tokenizer
+from tokenizer import get_tokenizer, resolve_tokenizer_path
 
 
 def _parse_noise_sweep(value: str) -> List[float]:
@@ -93,7 +93,13 @@ def main() -> None:
         "--checkpoint_path",
         type=Path,
         default=Path("checkpoints/modelscope/Llama-2-7b-chat-ms/model.pth"),
-        help="Path to model.pth for both target and draft.",
+        help="Path to target model checkpoint (.pth).",
+    )
+    parser.add_argument(
+        "--draft_checkpoint_path",
+        type=Path,
+        default=None,
+        help="Path to draft model checkpoint (.pth). Defaults to --checkpoint_path.",
     )
     parser.add_argument("--device", type=str, default="cuda:0", help="Target device.")
     parser.add_argument("--draft_device", type=str, default="cuda:1", help="Draft device.")
@@ -165,8 +171,10 @@ def main() -> None:
     model_lib.set_attention_backend(args.attention_backend)
 
     checkpoint_path: Path = args.checkpoint_path
+    draft_checkpoint_path: Path = args.draft_checkpoint_path or checkpoint_path
     assert checkpoint_path.is_file(), str(checkpoint_path)
-    tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+    assert draft_checkpoint_path.is_file(), str(draft_checkpoint_path)
+    tokenizer_path = resolve_tokenizer_path(checkpoint_path.parent)
     assert tokenizer_path.is_file(), str(tokenizer_path)
 
     noise_sweep = _parse_noise_sweep(args.noise_sweep)
@@ -182,9 +190,9 @@ def main() -> None:
         set_post_matmul_output_quant_bits(model, int(args.post_matmul_quant_bits))
     print(f"Loading draft model on {args.draft_device} ...")
     if args.draft_dequantize_int8:
-        draft_model = g._load_int8_weight_only_as_fp_model(checkpoint_path, args.draft_device, precision, use_tp=False)
+        draft_model = g._load_int8_weight_only_as_fp_model(draft_checkpoint_path, args.draft_device, precision, use_tp=False)
     else:
-        draft_model = g._load_model(checkpoint_path, args.draft_device, precision, use_tp=False)
+        draft_model = g._load_model(draft_checkpoint_path, args.draft_device, precision, use_tp=False)
     if args.draft_fake_act_quant_int8:
         replace_linear_fake_act_quant(draft_model)
     if args.draft_post_matmul_quant_bits:

@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tokenizer import get_tokenizer
+from tokenizer import get_tokenizer, resolve_tokenizer_path
 
 try:
     from GPTQ import GenericGPTQRunner, InputRecorder
@@ -17,7 +17,7 @@ try:
 except:
     pass
 
-from model import Transformer
+from model import ModelArgs, Transformer
 
 ##### Quantization Primitives ######
 
@@ -681,7 +681,7 @@ def quantize(
     t0 = time.time()
 
     with torch.device('meta'):
-        model = Transformer.from_name(checkpoint_path.parent.name)
+        model = Transformer(ModelArgs.from_checkpoint_dir(checkpoint_path.parent))
 
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
     model.load_state_dict(checkpoint, assign=True)
@@ -709,7 +709,7 @@ def quantize(
         print("Quantizing model weights for int4 weight-only affine per-channel groupwise quantization using GPTQ...")
         quant_handler = WeightOnlyInt4GPTQQuantHandler(model, groupsize)
 
-        tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+        tokenizer_path = resolve_tokenizer_path(checkpoint_path.parent)
         assert tokenizer_path.is_file(), str(tokenizer_path)
         tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
 

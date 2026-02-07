@@ -50,8 +50,8 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from model import Transformer
-from model import set_attention_backend
-from tokenizer import get_tokenizer
+from model import ModelArgs, set_attention_backend
+from tokenizer import get_tokenizer, resolve_tokenizer_path
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -263,7 +263,7 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
 def _load_model(checkpoint_path, device, precision, use_tp, *, int8_act_quant: bool = False):
     use_cuda = 'cuda' in device
     with torch.device('meta'):
-        model = Transformer.from_name(checkpoint_path.parent.name)
+        model = Transformer(ModelArgs.from_checkpoint_dir(checkpoint_path.parent))
 
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
@@ -325,7 +325,7 @@ def _dequantize_int8_weight_only_state_dict(
 
 def _load_int8_weight_only_as_fp_model(checkpoint_path: Path, device, precision, use_tp):
     with torch.device("meta"):
-        model = Transformer.from_name(checkpoint_path.parent.name)
+        model = Transformer(ModelArgs.from_checkpoint_dir(checkpoint_path.parent))
 
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
     if "model" in checkpoint and "stories" in str(checkpoint_path):
@@ -460,7 +460,7 @@ def main(
     """
     assert checkpoint_path.is_file(), checkpoint_path
 
-    tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+    tokenizer_path = resolve_tokenizer_path(checkpoint_path.parent)
     assert tokenizer_path.is_file(), str(tokenizer_path)
 
     global print
@@ -730,7 +730,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, (not args.no_compile_block_mask), args.profile, args.draft_checkpoint_path,
+        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, (args.compile and (not args.no_compile_block_mask)), args.profile, args.draft_checkpoint_path,
         args.draft_device,
         args.draft_noise_std,
         args.draft_noise_seed,

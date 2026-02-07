@@ -28,7 +28,11 @@ def convert_hf_checkpoint(
     if model_name is None:
         model_name = checkpoint_dir.name
 
-    config = ModelArgs.from_name(model_name)
+    config_path = checkpoint_dir / "config.json"
+    if config_path.is_file():
+        config = ModelArgs.from_hf_config_path(config_path)
+    else:
+        config = ModelArgs.from_name(model_name)
     print(f"Model config {config.__dict__}")
 
     # Load the json file containing weight mapping
@@ -50,16 +54,29 @@ def convert_hf_checkpoint(
       except AssertionError:
         print(f"{model_map_json_pytorch} not found")
    
-    if model_map_json is None: raise Exception("No model map found!")
-
-    with open(model_map_json) as json_map:
-        bin_index = json.load(json_map)
+    bin_files = None
+    if model_map_json is not None:
+        with open(model_map_json) as json_map:
+            bin_index = json.load(json_map)
+        bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
+    else:
+        # Handle unsharded checkpoints (e.g. Llama-3.2-1B stores a single model.safetensors).
+        safetensors_file = checkpoint_dir / "model.safetensors"
+        pytorch_file = checkpoint_dir / "pytorch_model.bin"
+        if safetensors_file.is_file():
+            bin_files = {safetensors_file}
+        elif pytorch_file.is_file():
+            bin_files = {pytorch_file}
+        else:
+            raise Exception("No model weights found (expected an index json or model.safetensors / pytorch_model.bin)")
 
     weight_map = {
         "model.embed_tokens.weight": "tok_embeddings.weight",
         "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
         "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
         "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
+        "model.layers.{}.self_attn.q_norm.weight": "layers.{}.attention.q_norm.weight",
+        "model.layers.{}.self_attn.k_norm.weight": "layers.{}.attention.k_norm.weight",
         "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
         'model.layers.{}.self_attn.rotary_emb.inv_freq': None,
         'model.layers.{}.mlp.gate_proj.weight': 'layers.{}.feed_forward.w1.weight',
@@ -70,7 +87,6 @@ def convert_hf_checkpoint(
         "model.norm.weight": "norm.weight",
         "lm_head.weight": "output.weight",
     }
-    bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
 
     def permute(w, n_head):
         dim = config.dim
@@ -93,12 +109,14 @@ def convert_hf_checkpoint(
         if "layers" in key:
             abstract_key = re.sub(r'(\d+)', '{}', key)
             layer_num = re.search(r'\d+', key).group(0)
-            new_key = weight_map[abstract_key]
+            new_key = weight_map.get(abstract_key)
             if new_key is None:
                 continue
             new_key = new_key.format(layer_num)
         else:
-            new_key = weight_map[key]
+            new_key = weight_map.get(key)
+            if new_key is None:
+                continue
 
         final_result[new_key] = value
 
@@ -107,23 +125,28 @@ def convert_hf_checkpoint(
             q = final_result[key]
             k = final_result[key.replace("wq", "wk")]
             v = final_result[key.replace("wq", "wv")]
-            q = permute(q, config.n_head)
-            k = permute(k, config.n_local_heads)
+            # LLaMA-2 style checkpoints need RoPE permutation, while newer families
+            # (e.g. Qwen / Llama-3) already store packed projection matrices.
+            if q.shape[0] == config.dim:
+                q = permute(q, config.n_head)
+            if k.shape[0] == config.dim and config.n_local_heads == config.n_head:
+                k = permute(k, config.n_local_heads)
             final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
             del final_result[key]
             del final_result[key.replace("wq", "wk")]
             del final_result[key.replace("wq", "wv")]
     print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
     torch.save(final_result, checkpoint_dir / "model.pth")
-    if 'llama-3-' in model_name.lower() or 'llama-3.1-' in model_name.lower():
-        if 'llama-3.1-405b' in model_name.lower():
-            original_dir = checkpoint_dir / "original" / "mp16"
-        else:
-            original_dir = checkpoint_dir / "original"
-        tokenizer_model = original_dir / "tokenizer.model"
-        tokenizer_model_tiktoken = checkpoint_dir / "tokenizer.model"
-        print(f"Copying {tokenizer_model} to {tokenizer_model_tiktoken}")
-        shutil.copy(tokenizer_model, tokenizer_model_tiktoken)
+    tokenizer_dest = checkpoint_dir / "tokenizer.model"
+    if not tokenizer_dest.is_file():
+        for src in (
+            checkpoint_dir / "original" / "mp16" / "tokenizer.model",
+            checkpoint_dir / "original" / "tokenizer.model",
+        ):
+            if src.is_file():
+                print(f"Copying {src} to {tokenizer_dest}")
+                shutil.copy(src, tokenizer_dest)
+                break
 
 if __name__ == '__main__':
     import argparse
