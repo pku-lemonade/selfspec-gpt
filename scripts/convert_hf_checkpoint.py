@@ -135,6 +135,9 @@ def convert_hf_checkpoint(
             del final_result[key]
             del final_result[key.replace("wq", "wk")]
             del final_result[key.replace("wq", "wv")]
+    if "output.weight" not in final_result and "tok_embeddings.weight" in final_result:
+        final_result["output.weight"] = final_result["tok_embeddings.weight"]
+
     print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
     torch.save(final_result, checkpoint_dir / "model.pth")
     tokenizer_dest = checkpoint_dir / "tokenizer.model"
