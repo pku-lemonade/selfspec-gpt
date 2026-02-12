@@ -15,6 +15,14 @@ wandb
 .cache
 datasets
 
+# openspec skills
+.agent
+.claude
+.codex
+.gemini
+.github
+.opencode
+
 # downloaded by our tests
 original_model.py
 original_adapter.py
