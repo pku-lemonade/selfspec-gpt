@@ -53,6 +53,7 @@ from model import Transformer
 from model import ModelArgs, set_attention_backend, set_read_noise_std
 from tokenizer import get_tokenizer, resolve_tokenizer_path
 from draft_noise import resolve_level_based_draft_noise_stds
+from selfspec_stats import accept_counts_to_stats, build_stats_meta, resolve_stats_out, write_json
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -472,6 +473,8 @@ def main(
     speculate_k: int = 5,
     read_noise_std: float = 0.0,
     attention_backend: str = "flex",
+    stats_out: Optional[Path] = None,
+    no_stats_meta: bool = False,
     device=default_device,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
@@ -500,6 +503,9 @@ def main(
     print(f"Using device={device}")
     if is_speculative and draft_device != device:
         print(f"Using draft_device={draft_device}")
+
+    if stats_out is not None and not is_speculative:
+        raise ValueError("--stats_out requires speculative decoding. Provide --draft_checkpoint_path.")
 
     set_attention_backend(attention_backend)
     set_read_noise_std(read_noise_std)
@@ -661,10 +667,12 @@ def main(
                 temperature=temperature,
                 top_k=top_k,
             )
-            aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
             continue
+
+        if is_speculative:
+            aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if hasattr(prof, "export_chrome_trace"):
             if use_tp:
                 prof.export_chrome_trace(f"{profile}_rank_{rank}.json")
@@ -687,13 +695,88 @@ def main(
         print(f"Bandwidth achieved: {model_size * generated_tokens_sec / 1e9:.02f} GB/s")
         total_tokens_sec = y.numel() / t
         print(f"FLOPS achieved: {params * total_tokens_sec * 2 / 1e12:.02f} TF/s")
-        print()
+    print()
     print("==========")
+    counts_aggregated = None
     if is_speculative:
-        counts_aggregated = [sum(i) for i in zip(*aggregate_metrics['accept_counts'])]
-        acceptance_probs = [i/sum(counts_aggregated) for i in counts_aggregated]
-        print(f"Acceptance probs: {acceptance_probs}")
-        print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
+        if aggregate_metrics["accept_counts"]:
+            counts_aggregated = [sum(i) for i in zip(*aggregate_metrics["accept_counts"])]
+            total_bursts = sum(counts_aggregated)
+            if total_bursts > 0:
+                acceptance_probs = [c / total_bursts for c in counts_aggregated]
+                mean_accepted = sum(idx * c for idx, c in enumerate(counts_aggregated)) / total_bursts
+                print(f"Acceptance probs: {acceptance_probs}")
+                print(f"Mean Accepted: {mean_accepted}")
+            else:
+                print("Acceptance probs: N/A (no speculative bursts recorded)")
+        else:
+            print("Acceptance probs: N/A (no samples recorded)")
+
+    if stats_out is not None and (not use_tp or rank == 0):
+        if counts_aggregated is None:
+            raise ValueError("No speculative acceptance histogram available for --stats_out export.")
+
+        stats_path, meta_path = resolve_stats_out(stats_out)
+        stats_payload = accept_counts_to_stats(counts_aggregated, k=speculate_k)
+        write_json(stats_path, stats_payload)
+
+        if not no_stats_meta:
+            repo_root = Path(__file__).resolve().parent
+            run_id = stats_path.parent.name or stats_path.stem
+            meta_payload = build_stats_meta(
+                stats=stats_payload,
+                run_id=run_id,
+                repo_root=repo_root,
+                paths={
+                    "stats": str(stats_path),
+                    "stats_meta": str(meta_path),
+                },
+                model={
+                    "checkpoint_path": str(checkpoint_path),
+                    "draft_checkpoint_path": str(draft_checkpoint_path) if draft_checkpoint_path is not None else None,
+                    "tokenizer_path": str(tokenizer_path),
+                },
+                generation={
+                    "prompt_length": int(prompt_length),
+                    "max_new_tokens": int(max_new_tokens),
+                    "num_samples": int(num_samples),
+                    "batch_size": int(batch_size),
+                    "top_k": int(top_k),
+                    "temperature": float(temperature),
+                    "speculate_k": int(speculate_k),
+                    "is_chat": bool(is_chat),
+                },
+                knobs={
+                    "attention_backend": str(attention_backend),
+                    "read_noise_std": float(read_noise_std),
+                    "draft_noise_std": list(draft_noise_std) if isinstance(draft_noise_std, (list, tuple)) else float(draft_noise_std),
+                    "draft_noise_level_stds": None if draft_noise_level_stds is None else [float(x) for x in draft_noise_level_stds],
+                    "draft_noise_levels": None if draft_noise_levels is None else [int(x) for x in draft_noise_levels],
+                    "draft_noise_seed": int(draft_noise_seed),
+                    "draft_dequantize_int8": bool(draft_dequantize_int8),
+                    "draft_fake_act_quant_int8": bool(draft_fake_act_quant_int8),
+                    "int8_act_quant": bool(int8_act_quant),
+                    "post_matmul_quant_bits": int(post_matmul_quant_bits),
+                    "draft_post_matmul_quant_bits": int(draft_post_matmul_quant_bits),
+                    "compile": bool(compile),
+                    "compile_prefill": bool(compile_prefill),
+                    "compile_block_mask": bool(compile_block_mask),
+                    "device": str(device),
+                    "draft_device": str(draft_device),
+                },
+                seeds={
+                    "sample_seed": 1234,
+                },
+                aggregation={
+                    "compile_warmup_excluded": bool(compile),
+                    "total_bursts": int(sum(counts_aggregated)),
+                },
+            )
+            write_json(meta_path, meta_payload)
+
+        print(f"Wrote stats to: {stats_path}")
+        if not no_stats_meta:
+            print(f"Wrote stats meta to: {meta_path}")
 
     print(f"Batch Size: {batch_size}")
     print(f"Prompt Length: {prompt_length}")
@@ -800,6 +883,17 @@ if __name__ == '__main__':
         default='flex',
         help='Attention backend to use. Use sdpa as a stability fallback if flex_attention crashes.',
     )
+    parser.add_argument(
+        '--stats_out',
+        type=Path,
+        default=None,
+        help='Write calculator-compatible speculation stats JSON. If path is a directory (or has no .json suffix), writes <path>/stats.json.',
+    )
+    parser.add_argument(
+        '--no_stats_meta',
+        action='store_true',
+        help='Disable writing stats_meta.json sidecar when exporting stats.',
+    )
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
     args = parser.parse_args()
@@ -819,5 +913,7 @@ if __name__ == '__main__':
         args.speculate_k,
         args.read_noise_std,
         args.attention_backend,
+        args.stats_out,
+        args.no_stats_meta,
         args.device,
     )

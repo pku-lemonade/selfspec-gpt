@@ -228,6 +228,56 @@ To additionally quantize activations per-token and run int8xint8 matmuls for tar
 
 Note: Running on an A100 80GB, albeit power-limited to 330 watts. Empirically, seems like peak bandwidth is about 1700 GB/s.
 
+### Export calculator-compatible acceptance stats (`stats.json`)
+
+To export a `selfspec-calculator` / `ppa-calculator` compatible acceptance histogram from a speculative run, pass `--stats_out`:
+
+```bash
+python generate.py --compile \
+  --checkpoint_path checkpoints/$MODEL_REPO/model.pth \
+  --draft_checkpoint_path checkpoints/$DRAFT_MODEL_REPO/model_int8.pth \
+  --speculate_k 5 --temperature 0 \
+  --stats_out out/my_run
+```
+
+This writes:
+- `out/my_run/stats.json`
+- `out/my_run/stats_meta.json` (disable with `--no_stats_meta`)
+
+You can then run `ppa-calculator` (from `../selfspec-calculator`) directly on the exported file:
+
+```bash
+ppa-calculator \
+  --model ../selfspec-calculator/examples/model.yaml \
+  --hardware ../selfspec-calculator/examples/hardware.yaml \
+  --stats out/my_run/stats.json \
+  --prompt-lengths 64 128 256 \
+  --output out/my_run/report.json
+```
+
+### Dataset aggregation (many prompts)
+
+Use the dataset runner to aggregate acceptance across a prompt set (`.txt` = one prompt per line, `.jsonl` = `{"prompt": "..."}` by default):
+
+```bash
+python scripts/dataset_selfspec_stats.py \
+  --checkpoint_path checkpoints/$MODEL_REPO/model.pth \
+  --draft_checkpoint_path checkpoints/$DRAFT_MODEL_REPO/model_int8.pth \
+  --prompts prompts.txt \
+  --run_id my_dataset_run
+```
+
+Prompt-length sweep mode writes one file per length:
+
+```bash
+python scripts/dataset_selfspec_stats.py \
+  --checkpoint_path checkpoints/$MODEL_REPO/model.pth \
+  --draft_checkpoint_path checkpoints/$DRAFT_MODEL_REPO/model_int8.pth \
+  --prompts prompts.jsonl \
+  --prompt_lengths 64 128 256 \
+  --run_id my_sweep
+```
+
 
 ## Tensor Parallelism
 ```bash

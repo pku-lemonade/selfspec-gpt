@@ -348,8 +348,9 @@ class Attention(nn.Module):
 
             kv_pos = torch.arange(kv_len, device=input_pos.device).view(1, -1)
             q_pos = input_pos.view(-1, 1)
-            # bool mask: True means "mask out"
-            attn_mask = kv_pos > q_pos
+            # NOTE: For torch.nn.functional.scaled_dot_product_attention, boolean masks use
+            # True = "attend/keep", False = "mask out".
+            attn_mask = kv_pos <= q_pos
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
         else:
             raise ValueError(f"Unknown attention backend: {ATTENTION_BACKEND}")
