@@ -8,8 +8,10 @@ export DEVICE=${DEVICE:-cuda:0}
 export DRAFT_DEVICE=${DRAFT_DEVICE:-cuda:1}
 
 # Additive Gaussian weight noise applied to the draft model after load.
-# Provide 3 stds: FFN QKV OUT.
+# Level-based config: map levels 1/2/3 to the per-bucket stds (level 0 = 0 disables noise).
 export DRAFT_NOISE_STD=${DRAFT_NOISE_STD:-"1e-3 1e-3 1e-3"}
+export DRAFT_NOISE_LEVEL_STDS=${DRAFT_NOISE_LEVEL_STDS:-"0 $DRAFT_NOISE_STD"}
+export DRAFT_NOISE_LEVELS=${DRAFT_NOISE_LEVELS:-"1 2 3"}
 export DRAFT_NOISE_SEED=${DRAFT_NOISE_SEED:-1234}
 
 export PROMPT=${PROMPT:-"Hi my name is"}
@@ -35,7 +37,7 @@ time "$PYTHON" generate.py \
   --checkpoint_path "$MODEL_DIR/model.pth" \
   --draft_checkpoint_path "$MODEL_DIR/model.pth" \
   --device "$DEVICE" --draft_device "$DRAFT_DEVICE" \
-  --draft_noise_std $DRAFT_NOISE_STD --draft_noise_seed "$DRAFT_NOISE_SEED" \
+  --draft_noise_level_stds $DRAFT_NOISE_LEVEL_STDS --draft_noise_levels $DRAFT_NOISE_LEVELS --draft_noise_seed "$DRAFT_NOISE_SEED" \
   --speculate_k "$SPECULATE_K" \
   --prompt "$PROMPT" \
   --max_new_tokens "$MAX_NEW_TOKENS" --num_samples "$NUM_SAMPLES" --temperature "$TEMPERATURE"

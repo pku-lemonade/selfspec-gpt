@@ -197,14 +197,15 @@ export DRAFT_MODEL_REPO=meta-llama/Llama-2-7b-chat-hf
 python generate.py --compile --checkpoint_path checkpoints/$MODEL_REPO/model.pth --draft_checkpoint_path checkpoints/$DRAFT_MODEL_REPO/model_int8.pth
 ```
 
-You can also run the draft model on a different device (e.g. `cuda:1`) and optionally add per-component weight noise to the draft model after load (FFN / QKV / output projections):
+You can also run the draft model on a different device (e.g. `cuda:1`) and optionally add draft weight noise after load. The preferred configuration uses discrete noise **levels** with a shared level→std table (and supports per-layer configuration via `3*n_layer` level assignments).
 ```
 export MODEL_DIR=checkpoints/modelscope/Llama-2-7b-chat-ms
 python generate.py --compile --compile_prefill \
   --checkpoint_path $MODEL_DIR/model.pth \
   --draft_checkpoint_path $MODEL_DIR/model.pth \
   --device cuda:0 --draft_device cuda:1 \
-  --draft_noise_std 1e-3 1e-3 1e-3 --draft_noise_seed 1234 \
+  --draft_noise_level_stds 0 1e-3 \
+  --draft_noise_levels 1 1 1 --draft_noise_seed 1234 \
   --speculate_k 5 --temperature 0
 ```
 
@@ -216,9 +217,11 @@ python generate.py --compile --compile_prefill \
   --draft_checkpoint_path $MODEL_DIR/model_int8.pth \
   --draft_dequantize_int8 \
   --device cuda:0 --draft_device cuda:1 \
-  --draft_noise_std 1e-3 0 0 --draft_noise_seed 1234 \
+  --draft_noise_level_stds 0 1e-3 \
+  --draft_noise_levels 1 0 0 --draft_noise_seed 1234 \
   --speculate_k 5 --temperature 0
 ```
+Legacy shortcut: `--draft_noise_std` is still supported (1 value or 3 values: FFN QKV OUT) and is applied uniformly across layers when level-based flags are not provided.
 If you hit a `CUDA ... illegal memory access` inside `create_block_mask`, add `--no_compile_block_mask`.
 
 To additionally quantize activations per-token and run int8xint8 matmuls for target linear layers, enable `--int8_act_quant`. To apply fake activation quantization to the draft model (still fp matmuls), enable `--draft_fake_act_quant_int8`.

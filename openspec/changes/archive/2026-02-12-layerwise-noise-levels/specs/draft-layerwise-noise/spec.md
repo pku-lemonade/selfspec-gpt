@@ -29,8 +29,12 @@ When draft weight noise is enabled, the system SHALL add i.i.d. Gaussian noise t
 - **WHEN** draft noise is enabled and the resolved std for a given bucket is greater than 0
 - **THEN** the system perturbs the draft model’s corresponding weights for each layer:
   - QKV: `layers.<i>.attention.wqkv.weight`
-  - OUT: `layers.<i>.attention.wo.weight`
+  - OUT: `layers.<i>.attention.wo.weight` and `output.weight`
   - FFN: `layers.<i>.feed_forward.w1.weight`, `layers.<i>.feed_forward.w2.weight`, `layers.<i>.feed_forward.w3.weight`
+
+#### Scenario: Output projection follows OUT noise
+- **WHEN** draft noise is enabled
+- **THEN** the system perturbs `output.weight` using the resolved OUT std (and if per-layer levels are provided, uses the last layer’s OUT std)
 
 ### Requirement: Validate noise configuration inputs
 The system SHALL reject invalid draft noise configuration inputs with a clear error.

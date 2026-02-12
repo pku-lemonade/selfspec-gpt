@@ -52,6 +52,7 @@ sys.path.append(str(wd))
 from model import Transformer
 from model import ModelArgs, set_attention_backend, set_read_noise_std
 from tokenizer import get_tokenizer, resolve_tokenizer_path
+from draft_noise import resolve_level_based_draft_noise_stds
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -366,20 +367,21 @@ def _coerce_draft_noise_stds(draft_noise_std: Union[float, Sequence[float]]) -> 
             return v, v, v
         if len(draft_noise_std) == 3:
             return float(draft_noise_std[0]), float(draft_noise_std[1]), float(draft_noise_std[2])
-    raise ValueError("draft_noise_std must be 1 value or 3 values: FFN QKV OUT")
+    raise ValueError("draft_noise_std must be 1 value or 3 values (FFN QKV OUT)")
 
 
 @torch.no_grad()
 def add_gaussian_noise_to_draft_weights_(
     model: Transformer,
     *,
-    ffn_std: float,
-    qkv_std: float,
-    out_std: float,
+    per_layer_stds: Sequence[Tuple[float, float, float]],
+    output_std: float,
     seed: int,
 ) -> dict:
     counts = {"ffn": 0, "qkv": 0, "out": 0}
-    if ffn_std <= 0 and qkv_std <= 0 and out_std <= 0:
+    if len(per_layer_stds) == 0:
+        return counts
+    if (output_std <= 0) and all((ffn <= 0 and qkv <= 0 and out <= 0) for ffn, qkv, out in per_layer_stds):
         return counts
 
     device = model.output.weight.device
@@ -392,15 +394,28 @@ def add_gaussian_noise_to_draft_weights_(
             std = 0.0
             bucket = None
 
-            if name.endswith(".feed_forward.w1.weight") or name.endswith(".feed_forward.w2.weight") or name.endswith(".feed_forward.w3.weight"):
-                std = ffn_std
-                bucket = "ffn"
-            elif name.endswith(".attention.wqkv.weight"):
-                std = qkv_std
-                bucket = "qkv"
-            elif name.endswith(".attention.wo.weight") or name == "output.weight":
-                std = out_std
+            if name == "output.weight":
+                std = float(output_std)
                 bucket = "out"
+            elif name.startswith("layers."):
+                rest = name[len("layers.") :]
+                idx_str, _, suffix = rest.partition(".")
+                if not idx_str.isdigit():
+                    continue
+                layer_idx = int(idx_str)
+                if layer_idx < 0 or layer_idx >= len(per_layer_stds):
+                    continue
+
+                ffn_std, qkv_std, out_std = per_layer_stds[layer_idx]
+                if suffix.endswith("feed_forward.w1.weight") or suffix.endswith("feed_forward.w2.weight") or suffix.endswith("feed_forward.w3.weight"):
+                    std = float(ffn_std)
+                    bucket = "ffn"
+                elif suffix.endswith("attention.wqkv.weight"):
+                    std = float(qkv_std)
+                    bucket = "qkv"
+                elif suffix.endswith("attention.wo.weight"):
+                    std = float(out_std)
+                    bucket = "out"
 
             if std <= 0:
                 continue
@@ -446,6 +461,8 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     draft_device: Optional[str] = None,
     draft_noise_std: Union[float, Sequence[float]] = 0.0,
+    draft_noise_level_stds: Optional[Sequence[float]] = None,
+    draft_noise_levels: Optional[Sequence[int]] = None,
     draft_noise_seed: int = 1234,
     draft_dequantize_int8: bool = False,
     draft_fake_act_quant_int8: bool = False,
@@ -511,14 +528,48 @@ def main(
             from quantize import replace_linear_fake_act_quant
 
             replace_linear_fake_act_quant(draft_model)
-        ffn_std, qkv_std, out_std = _coerce_draft_noise_stds(draft_noise_std)
-        if ffn_std > 0 or qkv_std > 0 or out_std > 0:
-            print(
-                "Adding Gaussian noise to draft weights: "
-                f"ffn_std={ffn_std}, qkv_std={qkv_std}, out_std={out_std}, seed={draft_noise_seed}"
+        n_layer = len(draft_model.layers)
+        use_levels = (draft_noise_levels is not None) or (draft_noise_level_stds is not None)
+
+        per_layer_stds: Sequence[Tuple[float, float, float]]
+        output_std: float
+
+        if use_levels:
+            if draft_noise_levels is None or draft_noise_level_stds is None:
+                raise ValueError("Level-based draft noise requires both --draft_noise_level_stds and --draft_noise_levels.")
+            if isinstance(draft_noise_std, (list, tuple)) and list(draft_noise_std) != [0.0]:
+                print("WARNING: ignoring --draft_noise_std because level-based draft noise flags were provided")
+
+            per_layer_stds, output_std = resolve_level_based_draft_noise_stds(
+                draft_noise_level_stds=draft_noise_level_stds,
+                draft_noise_levels=draft_noise_levels,
+                n_layer=n_layer,
             )
+            ffn0, qkv0, out0 = per_layer_stds[0]
+            ffn_last, qkv_last, out_last = per_layer_stds[-1]
+            print(
+                "Adding Gaussian noise to draft weights (levels): "
+                f"n_layer={n_layer}, seed={draft_noise_seed}, "
+                f"layer0(ffn,qkv,out)=({ffn0},{qkv0},{out0}), "
+                f"layerLast(ffn,qkv,out)=({ffn_last},{qkv_last},{out_last}), "
+                f"output_std={output_std}"
+            )
+        else:
+            ffn_std, qkv_std, out_std = _coerce_draft_noise_stds(draft_noise_std)
+            per_layer_stds = [(ffn_std, qkv_std, out_std) for _ in range(n_layer)]
+            output_std = float(out_std)
+            if ffn_std > 0 or qkv_std > 0 or out_std > 0:
+                print(
+                    "Adding Gaussian noise to draft weights: "
+                    f"ffn_std={ffn_std}, qkv_std={qkv_std}, out_std={out_std}, seed={draft_noise_seed}"
+                )
+
+        if output_std > 0 or any((ffn > 0 or qkv > 0 or out > 0) for ffn, qkv, out in per_layer_stds):
             counts = add_gaussian_noise_to_draft_weights_(
-                draft_model, ffn_std=ffn_std, qkv_std=qkv_std, out_std=out_std, seed=draft_noise_seed
+                draft_model,
+                per_layer_stds=per_layer_stds,
+                output_std=output_std,
+                seed=draft_noise_seed,
             )
             print(f"Noised params (numel): ffn={counts['ffn']}, qkv={counts['qkv']}, out={counts['out']}")
 
@@ -721,6 +772,20 @@ if __name__ == '__main__':
         default=[0.0],
         help='Gaussian noise std(s) to add to draft model weights after load. Provide 1 value (all) or 3 values: FFN QKV OUT.',
     )
+    parser.add_argument(
+        '--draft_noise_level_stds',
+        type=float,
+        nargs='+',
+        default=None,
+        help='Draft noise level std table. Index i is noise level i. Requires --draft_noise_levels. Overrides --draft_noise_std.',
+    )
+    parser.add_argument(
+        '--draft_noise_levels',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Draft noise level assignments. Provide 1 value (all), 3 values (FFN QKV OUT), or 3*n_layer values (per-layer triplets in FFN QKV OUT order). Requires --draft_noise_level_stds.',
+    )
     parser.add_argument('--draft_noise_seed', type=int, default=1234, help='RNG seed for draft weight noise.')
     parser.add_argument(
         '--read_noise_std',
@@ -743,6 +808,8 @@ if __name__ == '__main__':
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, (args.compile and (not args.no_compile_block_mask)), args.profile, args.draft_checkpoint_path,
         args.draft_device,
         args.draft_noise_std,
+        args.draft_noise_level_stds,
+        args.draft_noise_levels,
         args.draft_noise_seed,
         args.draft_dequantize_int8,
         args.draft_fake_act_quant_int8,
