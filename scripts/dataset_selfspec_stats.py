@@ -217,7 +217,8 @@ def main() -> None:
         type=float,
         nargs="+",
         default=[0.0],
-        help="Gaussian noise std(s) to add to draft weights after load. Provide 1 value (all) or 3 values: FFN QKV OUT.",
+        help="Relative Gaussian noise std(s) to apply to draft weights after load (multiplicative). "
+             "Provide 1 value (all) or 3 values: FFN QKV OUT.",
     )
     parser.add_argument(
         "--draft_noise_level_stds",
@@ -265,7 +266,7 @@ def main() -> None:
         "--read_noise_std",
         type=float,
         default=0.0,
-        help="Per-matmul Gaussian read-noise std for stationary fp weights. 0 disables runtime read noise.",
+        help="Per-matmul relative Gaussian read-noise std for stationary fp weights (multiplicative). 0 disables runtime read noise.",
     )
     parser.add_argument(
         "--attention_backend",

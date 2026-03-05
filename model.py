@@ -60,7 +60,8 @@ def linear_with_read_noise(linear: nn.Module, x: Tensor) -> Tensor:
     weight = linear.weight
     if not weight.is_floating_point():
         return linear(x)
-    noisy_weight = weight + torch.randn_like(weight) * READ_NOISE_STD
+    # Relative read noise: multiplicative perturbation (e.g., std=0.1 means ~10%).
+    noisy_weight = weight * (1.0 + torch.randn_like(weight) * READ_NOISE_STD)
     return F.linear(x, noisy_weight, linear.bias)
 
 

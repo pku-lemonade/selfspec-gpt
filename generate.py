@@ -355,7 +355,8 @@ def add_gaussian_noise_to_model_weights_(model: Transformer, std: float, seed: i
         for _, param in model.named_parameters():
             if not param.is_floating_point():
                 continue
-            param.add_(torch.randn_like(param) * std)
+            # Relative write noise: multiplicative perturbation (e.g., std=0.1 means ~10%).
+            param.mul_(1.0 + torch.randn_like(param) * std)
 
 
 def _coerce_draft_noise_stds(draft_noise_std: Union[float, Sequence[float]]) -> Tuple[float, float, float]:
@@ -421,7 +422,8 @@ def add_gaussian_noise_to_draft_weights_(
             if std <= 0:
                 continue
 
-            param.add_(torch.randn_like(param) * std)
+            # Relative write noise: multiplicative perturbation (e.g., std=0.1 means ~10%).
+            param.mul_(1.0 + torch.randn_like(param) * std)
             counts[bucket] += param.numel()
     return counts
 
@@ -853,7 +855,8 @@ if __name__ == '__main__':
         type=float,
         nargs='+',
         default=[0.0],
-        help='Gaussian noise std(s) to add to draft model weights after load. Provide 1 value (all) or 3 values: FFN QKV OUT.',
+        help='Relative Gaussian noise std(s) to apply to draft weights after load (multiplicative). '
+             'Provide 1 value (all) or 3 values: FFN QKV OUT.',
     )
     parser.add_argument(
         '--draft_noise_level_stds',
@@ -874,7 +877,7 @@ if __name__ == '__main__':
         '--read_noise_std',
         type=float,
         default=0.0,
-        help='Per-matmul Gaussian read-noise std for stationary fp weights. 0 disables runtime read noise.',
+        help='Per-matmul relative Gaussian read-noise std for stationary fp weights (multiplicative). 0 disables runtime read noise.',
     )
     parser.add_argument(
         '--attention_backend',

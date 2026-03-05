@@ -168,7 +168,7 @@ def main() -> None:
         "--read_noise_std",
         type=float,
         default=0.0,
-        help="Per-matmul Gaussian read-noise std for stationary fp weights. 0 disables runtime read noise.",
+        help="Per-matmul relative Gaussian read-noise std for stationary fp weights (multiplicative). 0 disables runtime read noise.",
     )
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (recommended).")
     parser.add_argument("--compile_prefill", action="store_true", help="Also compile prefill (slower compile, faster prefill).")
