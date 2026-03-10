@@ -70,7 +70,18 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     return probs
 
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    probs = logits_to_probs(logits[:, -1], temperature, top_k)
+    next_logits = logits[:, -1]
+    if temperature <= 0:
+        if top_k is not None:
+            v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+            pivot = v.select(-1, -1).unsqueeze(-1)
+            next_logits = torch.where(next_logits < pivot, -float("Inf"), next_logits)
+        idx_next = torch.argmax(next_logits, dim=-1, keepdim=True).to(dtype=torch.int)
+        probs = torch.zeros_like(next_logits)
+        probs.scatter_(-1, idx_next, 1.0)
+        return idx_next, probs
+
+    probs = logits_to_probs(next_logits, temperature, top_k)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
@@ -100,10 +111,11 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
     block_mask = create_block_mask(causal_mask, 1, 1, model.max_seq_length, model.max_seq_length, device=cur_token.device)
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
+        current_input_pos = input_pos.clone()
         next_token, next_prob = decode_one_token(
-            model, cur_token, input_pos, block_mask, **sampling_kwargs
+            model, cur_token, current_input_pos, block_mask, **sampling_kwargs
         )
-        input_pos += 1
+        input_pos = current_input_pos + 1
         new_tokens.append(next_token.clone())
         callback(new_tokens[-1])
         new_probs.append(next_prob.clone())
@@ -124,7 +136,7 @@ def speculative_decode(
     speculate_k: int,
     **sampling_kwargs
 ) -> torch.Tensor:
-    # draft model inference sequentially
+    # Draft tokens are proposed sequentially on the draft model.
     target_device = cur_token.device
     draft_device = draft_model.output.weight.device
     cur_token_draft = cur_token.to(device=draft_device)
@@ -140,41 +152,69 @@ def speculative_decode(
     draft_tokens_draft = torch.cat(draft_tokens)
     draft_tokens = draft_tokens_draft.to(device=target_device)
     draft_token_ids = draft_tokens.view(-1).to(dtype=torch.long)
-    # parallel inference on target model using draft tokens
-    target_logits = model_forward(
-        model,
-        torch.cat([cur_token.view(1, 1), draft_tokens], dim=0).view(1, -1),
-        torch.arange(input_pos, input_pos + speculate_k + 1, device=target_device)
-    )
-    target_probs = logits_to_probs(target_logits[0], **sampling_kwargs)
     draft_probs = torch.cat(draft_probs, dim=0).to(device=target_device)
-    # q: target prob, p: draft prob
-    # q >= p: always accept draft token
-    # q < p: q/p prob to accept draft token
-    positions = torch.arange(0, speculate_k, device=target_device)
-    p = draft_probs[positions, draft_token_ids]
-    q = target_probs[positions, draft_token_ids]
-    accept_draft_prob = torch.minimum(torch.ones_like(q), q / p)
-    rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
 
-    if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
-        last_token = multinomial_sample_one_no_sync(target_probs[-1].unsqueeze(0))
-        # fill last token into draft model
-        model_forward(
-            draft_model,
-            draft_tokens_draft[-1].view(1, -1),
-            orig_input_pos_draft + speculate_k,
+    # Verify the burst with the same single-token target decode path used by normal generation.
+    target_block_mask = create_block_mask(
+        causal_mask,
+        1,
+        1,
+        model.max_seq_length,
+        model.max_seq_length,
+        device=target_device,
+    )
+    target_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=target_device)
+    cur_token_target = cur_token.view(1, -1)
+    accepted_tokens = []
+
+    for i in range(speculate_k):
+        current_input_pos = target_input_pos.clone()
+        _, target_prob = decode_one_token(
+            model,
+            cur_token_target,
+            current_input_pos,
+            target_block_mask,
+            **sampling_kwargs,
         )
-        return torch.cat([draft_tokens, last_token])
-    else:
-        accept_length = rejected_locations[0].item()
-        p = draft_probs[accept_length]
-        q = target_probs[accept_length]
-        new = q - p
-        new = torch.where(new > 0, new, 0.0)
-        new = new / new.sum()
-        next_token = multinomial_sample_one_no_sync(new.unsqueeze(0))
-        return torch.cat([draft_tokens[:accept_length], next_token])
+        target_input_pos = current_input_pos + 1
+
+        target_prob = target_prob[0]
+        draft_prob = draft_probs[i]
+        draft_token = draft_tokens[i].view(1, -1)
+        draft_token_id = draft_token_ids[i]
+
+        p = draft_prob[draft_token_id]
+        q = target_prob[draft_token_id]
+        accept_prob = torch.minimum(torch.ones_like(q), q / p)
+        rejected = torch.rand_like(accept_prob) > accept_prob
+        if bool(rejected.item()):
+            new = target_prob - draft_prob
+            new = torch.where(new > 0, new, 0.0)
+            new = new / new.sum()
+            next_token = multinomial_sample_one_no_sync(new.unsqueeze(0))
+            if accepted_tokens:
+                return torch.cat(accepted_tokens + [next_token])
+            return next_token
+
+        accepted_tokens.append(draft_token.clone())
+        cur_token_target = draft_token
+
+    last_input_pos = target_input_pos.clone()
+    last_token, _ = decode_one_token(
+        model,
+        cur_token_target,
+        last_input_pos,
+        target_block_mask,
+        **sampling_kwargs,
+    )
+
+    # Fill the last accepted draft token into the draft cache so the next burst starts from the same prefix.
+    model_forward(
+        draft_model,
+        draft_tokens_draft[-1].view(1, -1),
+        orig_input_pos_draft + speculate_k,
+    )
+    return torch.cat(accepted_tokens + [last_token])
 
 @torch.no_grad()
 def generate(

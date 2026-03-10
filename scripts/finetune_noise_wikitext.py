@@ -282,6 +282,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_path", type=Path, required=True, help="Base checkpoint (.pth) to fine-tune.")
     parser.add_argument("--output_path", type=Path, default=Path("checkpoints/Qwen/Qwen3-0.6B/model_wikitext_noise_ft.pth"))
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--teacher_checkpoint_path", type=Path, default=None, help="Optional frozen teacher checkpoint (.pth) for clean consistency targets.")
+    parser.add_argument("--teacher_device", type=str, default="cuda:1", help="Teacher device when --teacher_checkpoint_path is provided.")
     parser.add_argument("--attention_backend", type=str, choices=["flex", "sdpa"], default="sdpa")
     parser.add_argument("--seed", type=int, default=1234)
 
@@ -301,6 +303,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup_steps", type=int, default=20)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument(
+        "--noisy_ce_weight",
+        type=float,
+        default=1.0,
+        help="Weight on standard CE loss computed from noisy forward.",
+    )
+    parser.add_argument(
+        "--consistency_weight",
+        type=float,
+        default=0.0,
+        help="If > 0 and write noise is active, add CE(noisy_logits, clean_argmax_tokens) with this weight.",
+    )
+    parser.add_argument(
+        "--distill_kl_weight",
+        type=float,
+        default=0.0,
+        help="If > 0 and write noise is active, add KL(student || clean teacher) with this weight.",
+    )
+    parser.add_argument(
+        "--distill_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature used for KL teacher distillation.",
+    )
     parser.add_argument("--optimizer", type=str, choices=["adamw", "sgd"], default="adamw")
     parser.add_argument("--sgd_momentum", type=float, default=0.9)
 
@@ -338,6 +364,8 @@ def main() -> None:
     args = parse_args()
     if not args.checkpoint_path.is_file():
         raise FileNotFoundError(str(args.checkpoint_path))
+    if args.teacher_checkpoint_path is not None and not args.teacher_checkpoint_path.is_file():
+        raise FileNotFoundError(str(args.teacher_checkpoint_path))
     _require_files(args.train_parquet, name="train")
     _require_files(args.val_parquet, name="val")
     if args.seq_len < 8:
@@ -346,6 +374,10 @@ def main() -> None:
         raise ValueError("--batch_size and --grad_accum_steps must be >= 1")
     if args.max_steps < 1:
         raise ValueError("--max_steps must be >= 1")
+    if float(args.noisy_ce_weight) < 0 or float(args.consistency_weight) < 0 or float(args.distill_kl_weight) < 0:
+        raise ValueError("--noisy_ce_weight, --consistency_weight, and --distill_kl_weight must be >= 0")
+    if float(args.distill_temperature) <= 0:
+        raise ValueError("--distill_temperature must be > 0")
 
     torch.manual_seed(int(args.seed))
     random.seed(int(args.seed))
@@ -371,6 +403,20 @@ def main() -> None:
     for layer in model.layers:
         layer.attention.kv_cache = None
     input_pos = torch.arange(0, int(args.seq_len), device=args.device, dtype=torch.int64)
+
+    teacher = None
+    teacher_device = args.device
+    teacher_input_pos = input_pos
+    if args.teacher_checkpoint_path is not None:
+        teacher_device = args.teacher_device or args.device
+        print(f"Loading frozen teacher from {args.teacher_checkpoint_path} on {teacher_device}")
+        teacher = g._load_model(args.teacher_checkpoint_path, teacher_device, precision, use_tp=False)
+        teacher.eval()
+        with torch.device(teacher_device):
+            teacher.setup_caches(max_batch_size=int(args.batch_size), max_seq_length=int(args.seq_len))
+        for layer in teacher.layers:
+            layer.attention.kv_cache = None
+        teacher_input_pos = torch.arange(0, int(args.seq_len), device=teacher_device, dtype=torch.int64)
 
     write_noise_stds = _coerce_write_noise_stds(args.write_noise_std)
     read_noise_std = max(0.0, float(args.read_noise_std))
@@ -441,6 +487,9 @@ def main() -> None:
         t0 = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
+        accum_main_loss = 0.0
+        accum_cons_loss = 0.0
+        accum_distill_loss = 0.0
         bad_step = False
         bad_reason = ""
 
@@ -451,26 +500,86 @@ def main() -> None:
             use_write = mode in ("write", "both")
             use_read = mode in ("read", "both")
             this_read_noise = read_noise_std if use_read else 0.0
-            set_read_noise_std(this_read_noise)
+            needs_clean_teacher = use_write and (
+                float(args.consistency_weight) > 0 or float(args.distill_kl_weight) > 0
+            )
+            set_read_noise_std(0.0 if needs_clean_teacher else this_read_noise)
 
             noise_seed = int(args.seed) + attempt * 100003 + micro
-            if use_write:
-                _apply_write_noise_(param_groups=noise_params, stds=write_noise_stds, seed=noise_seed, add=True)
-
             try:
                 x, y = train_stream.next_batch(batch_size=int(args.batch_size), seq_len=int(args.seq_len), device=args.device)
+                clean_targets: Optional[torch.Tensor] = None
+                clean_teacher_logits: Optional[torch.Tensor] = None
+                if needs_clean_teacher:
+                    with torch.no_grad():
+                        if teacher is not None:
+                            clean_logits = g.model_forward(teacher, x.to(teacher_device), teacher_input_pos)
+                            if float(args.consistency_weight) > 0:
+                                clean_targets = clean_logits.argmax(dim=-1).to(args.device)
+                            if float(args.distill_kl_weight) > 0:
+                                clean_teacher_logits = clean_logits.to(args.device)
+                        else:
+                            clean_logits = g.model_forward(model, x, input_pos)
+                            if float(args.consistency_weight) > 0:
+                                clean_targets = clean_logits.argmax(dim=-1)
+                            if float(args.distill_kl_weight) > 0:
+                                clean_teacher_logits = clean_logits.detach()
+
+                set_read_noise_std(this_read_noise)
+                if use_write:
+                    _apply_write_noise_(param_groups=noise_params, stds=write_noise_stds, seed=noise_seed, add=True)
+
                 logits = g.model_forward(model, x, input_pos)
                 if not torch.isfinite(logits).all():
                     bad_step = True
                     bad_reason = "nonfinite_logits"
                     break
-                loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1))
-                if not torch.isfinite(loss):
+                main_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1))
+                if not torch.isfinite(main_loss):
                     bad_step = True
                     bad_reason = "nonfinite_loss"
                     break
-                (loss / float(args.grad_accum_steps)).backward()
-                accum_loss += float(loss.item())
+                total_loss = float(args.noisy_ce_weight) * main_loss
+
+                cons_loss_val = 0.0
+                if clean_targets is not None and float(args.consistency_weight) > 0:
+                    cons_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), clean_targets.reshape(-1))
+                    if not torch.isfinite(cons_loss):
+                        bad_step = True
+                        bad_reason = "nonfinite_consistency_loss"
+                        break
+                    total_loss = total_loss + float(args.consistency_weight) * cons_loss
+                    cons_loss_val = float(cons_loss.item())
+
+                distill_loss_val = 0.0
+                if clean_teacher_logits is not None and float(args.distill_kl_weight) > 0:
+                    temp = float(args.distill_temperature)
+                    student_log_probs = F.log_softmax(
+                        logits.float().reshape(-1, logits.size(-1)) / temp,
+                        dim=-1,
+                    )
+                    teacher_probs = F.softmax(
+                        clean_teacher_logits.float().reshape(-1, clean_teacher_logits.size(-1)) / temp,
+                        dim=-1,
+                    )
+                    distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temp * temp)
+                    if not torch.isfinite(distill_loss):
+                        bad_step = True
+                        bad_reason = "nonfinite_distill_loss"
+                        break
+                    total_loss = total_loss + float(args.distill_kl_weight) * distill_loss
+                    distill_loss_val = float(distill_loss.item())
+
+                if not torch.isfinite(total_loss):
+                    bad_step = True
+                    bad_reason = "nonfinite_total_loss"
+                    break
+
+                (total_loss / float(args.grad_accum_steps)).backward()
+                accum_main_loss += float(main_loss.item())
+                accum_cons_loss += cons_loss_val
+                accum_distill_loss += distill_loss_val
+                accum_loss += float(total_loss.item())
             finally:
                 if use_write:
                     _apply_write_noise_(param_groups=noise_params, stds=write_noise_stds, seed=noise_seed, add=False)
@@ -509,11 +618,15 @@ def main() -> None:
 
         step_time = time.perf_counter() - t0
         train_loss = accum_loss / float(args.grad_accum_steps)
+        train_main_loss = accum_main_loss / float(args.grad_accum_steps)
+        train_cons_loss = accum_cons_loss / float(args.grad_accum_steps)
+        train_distill_loss = accum_distill_loss / float(args.grad_accum_steps)
 
         if int(args.log_interval) > 0 and (step % int(args.log_interval) == 0):
             tok_s = float(tokens_per_step) / max(step_time, 1e-9)
             print(
-                f"step={step:04d} attempt={attempt:04d} loss={train_loss:.4f} lr={lr_now:.3e} "
+                f"step={step:04d} attempt={attempt:04d} "
+                f"loss={train_loss:.4f} main={train_main_loss:.4f} cons={train_cons_loss:.4f} distill={train_distill_loss:.4f} lr={lr_now:.3e} "
                 f"grad_norm={grad_norm:.3f} tok/s={tok_s:.1f}"
             )
 
@@ -547,7 +660,13 @@ def main() -> None:
 
     summary = {
         "checkpoint_path": str(args.checkpoint_path),
+        "teacher_checkpoint_path": None if args.teacher_checkpoint_path is None else str(args.teacher_checkpoint_path),
+        "teacher_device": None if args.teacher_checkpoint_path is None else str(teacher_device),
         "output_path": str(args.output_path),
+        "noisy_ce_weight": float(args.noisy_ce_weight),
+        "consistency_weight": float(args.consistency_weight),
+        "distill_kl_weight": float(args.distill_kl_weight),
+        "distill_temperature": float(args.distill_temperature),
         "train_parquet": [str(p) for p in args.train_parquet],
         "val_parquet": [str(p) for p in args.val_parquet],
         "steps": int(step),
