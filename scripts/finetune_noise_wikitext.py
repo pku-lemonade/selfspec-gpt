@@ -123,16 +123,69 @@ def _bucket_for_param(name: str) -> Optional[str]:
     return None
 
 
-def _collect_write_noise_params(model: torch.nn.Module) -> Dict[str, List[torch.nn.Parameter]]:
+def _layer_index_for_param(name: str) -> Optional[int]:
+    if not name.startswith("layers."):
+        return None
+    rest = name[len("layers.") :]
+    idx_str, _, _ = rest.partition(".")
+    if idx_str.isdigit():
+        return int(idx_str)
+    return None
+
+
+def _collect_write_noise_params(
+    model: torch.nn.Module,
+    *,
+    trainable_only: bool = False,
+) -> Dict[str, List[torch.nn.Parameter]]:
     groups: Dict[str, List[torch.nn.Parameter]] = {"ffn": [], "qkv": [], "out": []}
     for name, param in model.named_parameters():
-        if (not param.requires_grad) or (not param.is_floating_point()):
+        if trainable_only and (not param.requires_grad):
+            continue
+        if not param.is_floating_point():
             continue
         bucket = _bucket_for_param(name)
         if bucket is None:
             continue
         groups[bucket].append(param)
     return groups
+
+
+def _set_trainable_params_(
+    model: torch.nn.Module,
+    *,
+    train_buckets: Optional[Sequence[str]],
+    train_last_n_layers: int,
+) -> Dict[str, int]:
+    active_restriction = (train_buckets is not None and len(train_buckets) > 0) or int(train_last_n_layers) > 0
+    bucket_set = None if not train_buckets else {str(x) for x in train_buckets}
+    n_layers = len(getattr(model, "layers", []))
+    min_layer_idx = max(0, n_layers - int(train_last_n_layers)) if int(train_last_n_layers) > 0 else 0
+
+    stats = {
+        "trainable_tensors": 0,
+        "frozen_tensors": 0,
+        "trainable_params": 0,
+        "frozen_params": 0,
+    }
+
+    for name, param in model.named_parameters():
+        allow = True
+        if active_restriction:
+            allow = False
+            bucket = _bucket_for_param(name)
+            if bucket is not None and (bucket_set is None or bucket in bucket_set):
+                layer_idx = _layer_index_for_param(name)
+                if layer_idx is None or layer_idx >= min_layer_idx:
+                    allow = True
+        param.requires_grad_(allow)
+        if allow:
+            stats["trainable_tensors"] += 1
+            stats["trainable_params"] += int(param.numel())
+        else:
+            stats["frozen_tensors"] += 1
+            stats["frozen_params"] += int(param.numel())
+    return stats
 
 
 def _collect_cuda_indices(param_groups: Dict[str, Sequence[torch.nn.Parameter]]) -> List[int]:
@@ -348,6 +401,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prob_write", type=float, default=0.25, help="Sampling probability weight for write-only mode.")
     parser.add_argument("--prob_read", type=float, default=0.25, help="Sampling probability weight for read-only mode.")
     parser.add_argument("--prob_both", type=float, default=0.25, help="Sampling probability weight for write+read mode.")
+    parser.add_argument(
+        "--train_buckets",
+        type=str,
+        nargs="+",
+        choices=["ffn", "qkv", "out"],
+        default=None,
+        help="Optional subset of noisy weight buckets to optimize. Noise is still applied to all buckets.",
+    )
+    parser.add_argument(
+        "--train_last_n_layers",
+        type=int,
+        default=0,
+        help="If > 0, only optimize selected buckets in the last N transformer layers (plus output head when selected).",
+    )
 
     parser.add_argument("--save_interval", type=int, default=50, help="Save intermediate checkpoint every N steps (0 disables).")
     parser.add_argument("--save_dir", type=Path, default=Path("out/finetune_qwen3_0p6b_wikitext_noise"))
@@ -378,6 +445,8 @@ def main() -> None:
         raise ValueError("--noisy_ce_weight, --consistency_weight, and --distill_kl_weight must be >= 0")
     if float(args.distill_temperature) <= 0:
         raise ValueError("--distill_temperature must be > 0")
+    if int(args.train_last_n_layers) < 0:
+        raise ValueError("--train_last_n_layers must be >= 0")
 
     torch.manual_seed(int(args.seed))
     random.seed(int(args.seed))
@@ -403,6 +472,11 @@ def main() -> None:
     for layer in model.layers:
         layer.attention.kv_cache = None
     input_pos = torch.arange(0, int(args.seq_len), device=args.device, dtype=torch.int64)
+    trainable_stats = _set_trainable_params_(
+        model,
+        train_buckets=args.train_buckets,
+        train_last_n_layers=int(args.train_last_n_layers),
+    )
 
     teacher = None
     teacher_device = args.device
@@ -428,10 +502,15 @@ def main() -> None:
     )
     mode_rng = random.Random(int(args.seed) + 17)
 
-    noise_params = _collect_write_noise_params(model)
+    noise_params = _collect_write_noise_params(model, trainable_only=False)
     print(
         "Write-noise params (num tensors): "
         f"ffn={len(noise_params['ffn'])}, qkv={len(noise_params['qkv'])}, out={len(noise_params['out'])}"
+    )
+    print(
+        "Trainable params: "
+        f"tensors={trainable_stats['trainable_tensors']}, params={trainable_stats['trainable_params']} | "
+        f"frozen_tensors={trainable_stats['frozen_tensors']}, frozen_params={trainable_stats['frozen_params']}"
     )
     print(f"Noise mix probs: {dict(zip(mode_dist.names, mode_dist.probs))}")
     print(f"Write noise stds: {write_noise_stds}, read noise std: {read_noise_std}")
@@ -451,9 +530,13 @@ def main() -> None:
         add_eos=True,
     )
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        raise ValueError("No trainable parameters selected. Adjust --train_buckets / --train_last_n_layers.")
+
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            trainable_params,
             lr=float(args.lr),
             betas=(0.9, 0.95),
             eps=1e-8,
@@ -461,7 +544,7 @@ def main() -> None:
         )
     else:
         optimizer = torch.optim.SGD(
-            model.parameters(),
+            trainable_params,
             lr=float(args.lr),
             momentum=float(args.sgd_momentum),
             weight_decay=float(args.weight_decay),
@@ -679,6 +762,9 @@ def main() -> None:
         "write_noise_stds": write_noise_stds,
         "read_noise_std": float(read_noise_std),
         "mode_probs": dict(zip(mode_dist.names, mode_dist.probs)),
+        "train_buckets": None if args.train_buckets is None else [str(x) for x in args.train_buckets],
+        "train_last_n_layers": int(args.train_last_n_layers),
+        "trainable_stats": {k: int(v) for k, v in trainable_stats.items()},
     }
     summary_path = args.save_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
