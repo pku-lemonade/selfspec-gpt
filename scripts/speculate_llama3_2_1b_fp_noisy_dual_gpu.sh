@@ -3,9 +3,9 @@ set -euo pipefail
 
 export MODEL_DIR=${MODEL_DIR:-checkpoints/meta-llama/Llama-3.2-1B}
 
-# Target model on GPU0, noisy draft model on GPU1.
+# Target and noisy draft default to the same GPU. Override DRAFT_DEVICE to split them.
 export DEVICE=${DEVICE:-cuda:0}
-export DRAFT_DEVICE=${DRAFT_DEVICE:-cuda:1}
+export DRAFT_DEVICE=${DRAFT_DEVICE:-$DEVICE}
 
 # Additive Gaussian weight noise applied to the draft model after load.
 # Level-based config: map levels 1/2/3 to the per-bucket stds (level 0 = 0 disables noise).

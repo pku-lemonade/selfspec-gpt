@@ -336,7 +336,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_path", type=Path, default=Path("checkpoints/Qwen/Qwen3-0.6B/model_wikitext_noise_ft.pth"))
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--teacher_checkpoint_path", type=Path, default=None, help="Optional frozen teacher checkpoint (.pth) for clean consistency targets.")
-    parser.add_argument("--teacher_device", type=str, default="cuda:1", help="Teacher device when --teacher_checkpoint_path is provided.")
+    parser.add_argument("--teacher_device", type=str, default=None, help="Teacher device when --teacher_checkpoint_path is provided (defaults to --device).")
     parser.add_argument("--attention_backend", type=str, choices=["flex", "sdpa"], default="sdpa")
     parser.add_argument("--seed", type=int, default=1234)
 

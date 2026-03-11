@@ -102,7 +102,7 @@ def main() -> None:
         help="Path to draft model checkpoint (.pth). Defaults to --checkpoint_path.",
     )
     parser.add_argument("--device", type=str, default="cuda:0", help="Target device.")
-    parser.add_argument("--draft_device", type=str, default="cuda:1", help="Draft device.")
+    parser.add_argument("--draft_device", type=str, default=None, help="Draft device (defaults to --device).")
     parser.add_argument(
         "--draft_dequantize_int8",
         action="store_true",
@@ -181,6 +181,8 @@ def main() -> None:
 
     checkpoint_path: Path = args.checkpoint_path
     draft_checkpoint_path: Path = args.draft_checkpoint_path or checkpoint_path
+    if args.draft_device is None:
+        args.draft_device = args.device
     assert checkpoint_path.is_file(), str(checkpoint_path)
     assert draft_checkpoint_path.is_file(), str(draft_checkpoint_path)
     tokenizer_path = resolve_tokenizer_path(checkpoint_path.parent)
