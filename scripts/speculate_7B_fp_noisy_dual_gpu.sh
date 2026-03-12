@@ -1,7 +1,13 @@
 export MODEL_DIR=checkpoints/modelscope/Llama-2-7b-chat-ms
 
-# Target model on GPU0, noisy draft model on GPU1.
-export DEVICE=cuda:0
+# Prefer the second GPU when present; override DEVICE/DRAFT_DEVICE to choose explicitly.
+if [[ -z "${DEVICE:-}" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1 && [[ "$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')" -ge 2 ]]; then
+    export DEVICE=cuda:1
+  else
+    export DEVICE=cuda:0
+  fi
+fi
 export DRAFT_DEVICE=${DRAFT_DEVICE:-$DEVICE}
 
 # Additive Gaussian weight noise applied to the draft model after load.

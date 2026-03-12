@@ -8,7 +8,13 @@ set -euo pipefail
 export TARGET_MODEL_DIR=${TARGET_MODEL_DIR:-checkpoints/Qwen/Qwen3-1.7B}
 export DRAFT_MODEL_DIR=${DRAFT_MODEL_DIR:-checkpoints/Qwen/Qwen3-0.6B}
 
-export DEVICE=${DEVICE:-cuda:0}
+if [[ -z "${DEVICE:-}" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1 && [[ "$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')" -ge 2 ]]; then
+    export DEVICE=cuda:1
+  else
+    export DEVICE=cuda:0
+  fi
+fi
 export DRAFT_DEVICE=${DRAFT_DEVICE:-$DEVICE}
 
 export TARGET_CKPT=${TARGET_CKPT:-$TARGET_MODEL_DIR/model.pth}

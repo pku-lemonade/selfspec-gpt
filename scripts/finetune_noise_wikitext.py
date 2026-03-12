@@ -23,6 +23,12 @@ import generate as g
 from model import set_attention_backend, set_read_noise_std
 from tokenizer import get_tokenizer, resolve_tokenizer_path
 
+DEFAULT_CUDA_DEVICE = (
+    "cuda:1"
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1
+    else ("cuda:0" if torch.cuda.is_available() else "cpu")
+)
+
 
 def _coerce_write_noise_stds(values: Sequence[float]) -> Dict[str, float]:
     vals = [float(v) for v in values]
@@ -334,7 +340,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune a model on WikiText with mixed write/read noise.")
     parser.add_argument("--checkpoint_path", type=Path, required=True, help="Base checkpoint (.pth) to fine-tune.")
     parser.add_argument("--output_path", type=Path, default=Path("checkpoints/Qwen/Qwen3-0.6B/model_wikitext_noise_ft.pth"))
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default=DEFAULT_CUDA_DEVICE)
     parser.add_argument("--teacher_checkpoint_path", type=Path, default=None, help="Optional frozen teacher checkpoint (.pth) for clean consistency targets.")
     parser.add_argument("--teacher_device", type=str, default=None, help="Teacher device when --teacher_checkpoint_path is provided (defaults to --device).")
     parser.add_argument("--attention_backend", type=str, choices=["flex", "sdpa"], default="sdpa")

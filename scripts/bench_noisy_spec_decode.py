@@ -15,6 +15,12 @@ import model as model_lib
 from quantize import replace_linear_fake_act_quant, set_post_matmul_output_quant_bits
 from tokenizer import get_tokenizer, resolve_tokenizer_path
 
+DEFAULT_CUDA_DEVICE = (
+    "cuda:1"
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1
+    else ("cuda:0" if torch.cuda.is_available() else "cpu")
+)
+
 
 def _parse_noise_sweep(value: str) -> List[float]:
     if value is None:
@@ -101,7 +107,7 @@ def main() -> None:
         default=None,
         help="Path to draft model checkpoint (.pth). Defaults to --checkpoint_path.",
     )
-    parser.add_argument("--device", type=str, default="cuda:0", help="Target device.")
+    parser.add_argument("--device", type=str, default=DEFAULT_CUDA_DEVICE, help="Target device.")
     parser.add_argument("--draft_device", type=str, default=None, help="Draft device (defaults to --device).")
     parser.add_argument(
         "--draft_dequantize_int8",

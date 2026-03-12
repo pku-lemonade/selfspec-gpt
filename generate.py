@@ -43,7 +43,11 @@ torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True 
 torch._functorch.config.enable_autograd_cache = True
 
-default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+default_device = (
+    'cuda:1'
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1
+    else ('cuda:0' if torch.cuda.is_available() else 'cpu')
+)
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()

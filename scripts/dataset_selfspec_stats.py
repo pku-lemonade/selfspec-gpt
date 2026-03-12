@@ -18,6 +18,12 @@ from model import set_attention_backend, set_read_noise_std
 from selfspec_stats import accept_counts_to_stats, build_stats_meta, write_json
 from tokenizer import get_tokenizer, resolve_tokenizer_path
 
+DEFAULT_CUDA_DEVICE = (
+    "cuda:1"
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1
+    else ("cuda:0" if torch.cuda.is_available() else "cpu")
+)
+
 
 def _load_prompts_txt(path: Path) -> List[str]:
     prompts: List[str] = []
@@ -187,7 +193,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Aggregate speculative decoding acceptance stats over a prompt dataset.")
     parser.add_argument("--checkpoint_path", type=Path, required=True, help="Target model checkpoint (.pth).")
     parser.add_argument("--draft_checkpoint_path", type=Path, required=True, help="Draft model checkpoint (.pth).")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Target device.")
+    parser.add_argument("--device", type=str, default=DEFAULT_CUDA_DEVICE, help="Target device.")
     parser.add_argument("--draft_device", type=str, default=None, help="Draft device (defaults to --device).")
     parser.add_argument("--speculate_k", type=int, default=5, help="Speculative depth (k).")
     parser.add_argument("--max_new_tokens", type=int, default=200, help="Tokens to generate per prompt.")

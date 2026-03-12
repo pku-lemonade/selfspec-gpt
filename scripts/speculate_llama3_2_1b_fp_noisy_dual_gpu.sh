@@ -4,7 +4,13 @@ set -euo pipefail
 export MODEL_DIR=${MODEL_DIR:-checkpoints/meta-llama/Llama-3.2-1B}
 
 # Target and noisy draft default to the same GPU. Override DRAFT_DEVICE to split them.
-export DEVICE=${DEVICE:-cuda:0}
+if [[ -z "${DEVICE:-}" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1 && [[ "$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')" -ge 2 ]]; then
+    export DEVICE=cuda:1
+  else
+    export DEVICE=cuda:0
+  fi
+fi
 export DRAFT_DEVICE=${DRAFT_DEVICE:-$DEVICE}
 
 # Additive Gaussian weight noise applied to the draft model after load.
