@@ -57,7 +57,7 @@ from selfspec_stats import accept_counts_to_stats, build_stats_meta, resolve_sta
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
-    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
+    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.long)
 
 def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     logits = logits / max(temperature, 1e-5)
@@ -76,7 +76,7 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
             v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
             pivot = v.select(-1, -1).unsqueeze(-1)
             next_logits = torch.where(next_logits < pivot, -float("Inf"), next_logits)
-        idx_next = torch.argmax(next_logits, dim=-1, keepdim=True).to(dtype=torch.int)
+        idx_next = torch.argmax(next_logits, dim=-1, keepdim=True).to(dtype=torch.long)
         probs = torch.zeros_like(next_logits)
         probs.scatter_(-1, idx_next, 1.0)
         return idx_next, probs

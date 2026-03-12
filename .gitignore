@@ -14,6 +14,7 @@ out
 wandb
 .cache
 datasets
+references
 
 # openspec skills
 .agent
