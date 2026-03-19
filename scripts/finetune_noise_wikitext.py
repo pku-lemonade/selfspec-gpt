@@ -303,6 +303,213 @@ def _grad_norm_and_finite(model: torch.nn.Module) -> Tuple[float, bool]:
 
 
 @torch.no_grad()
+def _compute_acceptance_weights(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mode: str,
+    topk: int,
+    keep_ratio: float,
+    tau: float,
+) -> torch.Tensor:
+    student_flat = student_logits.float().reshape(-1, student_logits.size(-1))
+    teacher_flat = teacher_logits.float().reshape(-1, teacher_logits.size(-1))
+    n_tokens = int(student_flat.size(0))
+    if n_tokens == 0:
+        return torch.empty(0, device=student_logits.device, dtype=student_logits.dtype)
+
+    teacher_probs = F.softmax(teacher_flat, dim=-1)
+    student_log_probs = F.log_softmax(student_flat, dim=-1)
+    per_token_kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=-1)
+    teacher_top1 = teacher_flat.argmax(dim=-1)
+
+    mode = str(mode or "none").lower()
+    if mode == "none":
+        weights = torch.ones_like(per_token_kl)
+    elif mode == "easy_kl":
+        keep_ratio = min(max(float(keep_ratio), 0.0), 1.0)
+        keep_n = max(1, int(math.ceil(float(n_tokens) * keep_ratio)))
+        values, _ = torch.topk(per_token_kl, keep_n, largest=False)
+        threshold = values[-1]
+        weights = (per_token_kl <= threshold).float()
+    else:
+        topk = max(1, min(int(topk), int(student_flat.size(-1))))
+        topk_ids = torch.topk(student_flat, topk, dim=-1).indices
+        in_topk = (topk_ids == teacher_top1.unsqueeze(-1)).any(dim=-1).float()
+        if mode == "teacher_topk":
+            weights = in_topk
+        elif mode == "hybrid":
+            tau = max(float(tau), 1e-6)
+            weights = in_topk * torch.exp(-per_token_kl / tau)
+        else:
+            raise ValueError(f"Unknown acceptance weight mode: {mode}")
+
+        if float(weights.sum().item()) <= 0:
+            weights = torch.ones_like(per_token_kl)
+
+    denom = weights.sum().clamp_min(1e-6)
+    weights = weights * (float(n_tokens) / denom)
+    return weights.to(dtype=student_logits.dtype)
+
+
+def _compute_student_losses(
+    *,
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    clean_targets: Optional[torch.Tensor],
+    clean_teacher_logits: Optional[torch.Tensor],
+    noisy_ce_weight: float,
+    consistency_weight: float,
+    distill_kl_weight: float,
+    distill_temperature: float,
+    acceptance_weight_mode: str,
+    acceptance_topk: int,
+    acceptance_keep_ratio: float,
+    acceptance_tau: float,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
+    main_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1))
+    if not torch.isfinite(main_loss):
+        raise ValueError("nonfinite_loss")
+    total_loss = float(noisy_ce_weight) * main_loss
+
+    cons_loss_val = 0.0
+    if clean_targets is not None and float(consistency_weight) > 0:
+        cons_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), clean_targets.reshape(-1))
+        if not torch.isfinite(cons_loss):
+            raise ValueError("nonfinite_consistency_loss")
+        total_loss = total_loss + float(consistency_weight) * cons_loss
+        cons_loss_val = float(cons_loss.item())
+
+    distill_loss_val = 0.0
+    if clean_teacher_logits is not None and float(distill_kl_weight) > 0:
+        temp = float(distill_temperature)
+        weight_mode = str(acceptance_weight_mode or "none")
+        token_weights = _compute_acceptance_weights(
+            student_logits=logits,
+            teacher_logits=clean_teacher_logits,
+            mode=weight_mode,
+            topk=int(acceptance_topk),
+            keep_ratio=float(acceptance_keep_ratio),
+            tau=float(acceptance_tau),
+        )
+        student_log_probs = F.log_softmax(
+            logits.float().reshape(-1, logits.size(-1)) / temp,
+            dim=-1,
+        )
+        teacher_probs = F.softmax(
+            clean_teacher_logits.float().reshape(-1, clean_teacher_logits.size(-1)) / temp,
+            dim=-1,
+        )
+        per_token_distill = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=-1)
+        if weight_mode == "none":
+            distill_loss = per_token_distill.mean() * (temp * temp)
+        else:
+            distill_loss = ((per_token_distill * token_weights.float()).sum() / token_weights.float().sum().clamp_min(1e-6)) * (temp * temp)
+        if not torch.isfinite(distill_loss):
+            raise ValueError("nonfinite_distill_loss")
+        total_loss = total_loss + float(distill_kl_weight) * distill_loss
+        distill_loss_val = float(distill_loss.item())
+
+    if not torch.isfinite(total_loss):
+        raise ValueError("nonfinite_total_loss")
+    return total_loss, main_loss, cons_loss_val, distill_loss_val
+
+
+@torch.no_grad()
+def _asam_ascent_(
+    named_params: Sequence[Tuple[str, torch.nn.Parameter]],
+    *,
+    rho: float,
+    eta: float,
+) -> Dict[str, torch.Tensor]:
+    if rho <= 0:
+        return {}
+    scaled_norm_terms: List[torch.Tensor] = []
+    for name, param in named_params:
+        if param.grad is None:
+            continue
+        scale = param.abs().add(float(eta)) if name.endswith("weight") else torch.ones_like(param)
+        scaled_norm_terms.append(torch.linalg.vector_norm((param.grad * scale).float(), ord=2))
+    if not scaled_norm_terms:
+        return {}
+    grad_norm = torch.linalg.vector_norm(torch.stack(scaled_norm_terms), ord=2)
+    if float(grad_norm.item()) <= 0:
+        return {}
+    step_scale = float(rho) / float(grad_norm.item() + 1e-12)
+    eps_by_name: Dict[str, torch.Tensor] = {}
+    for name, param in named_params:
+        if param.grad is None:
+            continue
+        scale = param.abs().add(float(eta)) if name.endswith("weight") else torch.ones_like(param)
+        eps = param.grad * scale * scale * step_scale
+        param.add_(eps)
+        eps_by_name[name] = eps
+    return eps_by_name
+
+
+@torch.no_grad()
+def _asam_restore_(
+    named_params: Sequence[Tuple[str, torch.nn.Parameter]],
+    eps_by_name: Dict[str, torch.Tensor],
+) -> None:
+    for name, param in named_params:
+        eps = eps_by_name.get(name)
+        if eps is not None:
+            param.sub_(eps)
+
+
+@torch.no_grad()
+def _awp_ascent_(
+    named_params: Sequence[Tuple[str, torch.nn.Parameter]],
+    *,
+    adv_lr: float,
+    adv_eps: float,
+    eta: float,
+) -> Dict[str, torch.Tensor]:
+    if adv_lr <= 0 or adv_eps <= 0:
+        return {}
+    grad_terms: List[torch.Tensor] = []
+    for _, param in named_params:
+        if param.grad is None:
+            continue
+        grad_terms.append(torch.linalg.vector_norm(param.grad.float(), ord=2))
+    if not grad_terms:
+        return {}
+    grad_norm = torch.linalg.vector_norm(torch.stack(grad_terms), ord=2)
+    if float(grad_norm.item()) <= 0:
+        return {}
+
+    delta_by_name: Dict[str, torch.Tensor] = {}
+    step_scale = float(adv_lr) / float(grad_norm.item() + 1e-12)
+    for name, param in named_params:
+        if param.grad is None:
+            continue
+        param_scale = param.detach().abs().add(float(eta))
+        delta = param.grad * param_scale * step_scale
+        max_delta = param_scale * float(adv_eps)
+        delta = torch.maximum(torch.minimum(delta, max_delta), -max_delta)
+        param.add_(delta)
+        delta_by_name[name] = delta
+    return delta_by_name
+
+
+@torch.no_grad()
+def _awp_restore_(
+    named_params: Sequence[Tuple[str, torch.nn.Parameter]],
+    delta_by_name: Dict[str, torch.Tensor],
+) -> None:
+    for name, param in named_params:
+        delta = delta_by_name.get(name)
+        if delta is not None:
+            param.sub_(delta)
+
+
+def _disable_kv_cache_(model: torch.nn.Module) -> None:
+    for layer in getattr(model, "layers", []):
+        layer.attention.kv_cache = None
+
+
+@torch.no_grad()
 def _scale_grads_(model: torch.nn.Module, scale: float) -> None:
     s = float(scale)
     for p in model.parameters():
@@ -386,6 +593,61 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Temperature used for KL teacher distillation.",
     )
+    parser.add_argument(
+        "--acceptance_weight_mode",
+        type=str,
+        choices=["none", "easy_kl", "teacher_topk", "hybrid"],
+        default="none",
+        help="Optional acceptance-aware weighting applied to the teacher KL loss.",
+    )
+    parser.add_argument(
+        "--acceptance_topk",
+        type=int,
+        default=4,
+        help="Student top-k used by acceptance-aware token weighting.",
+    )
+    parser.add_argument(
+        "--acceptance_keep_ratio",
+        type=float,
+        default=0.5,
+        help="For easy_kl mode, keep the lowest-KL fraction of tokens.",
+    )
+    parser.add_argument(
+        "--acceptance_tau",
+        type=float,
+        default=0.5,
+        help="Temperature-like scale for acceptance-aware weighting.",
+    )
+    parser.add_argument(
+        "--asam_rho",
+        type=float,
+        default=0.0,
+        help="If > 0, enable ASAM with this rho. Current implementation expects --grad_accum_steps 1.",
+    )
+    parser.add_argument(
+        "--asam_eta",
+        type=float,
+        default=0.01,
+        help="ASAM eta used in the adaptive scaling term.",
+    )
+    parser.add_argument(
+        "--awp_lr",
+        type=float,
+        default=0.0,
+        help="If > 0, enable one-step adversarial weight perturbation with this ascent step size.",
+    )
+    parser.add_argument(
+        "--awp_eps",
+        type=float,
+        default=0.0,
+        help="Relative max perturbation magnitude for AWP.",
+    )
+    parser.add_argument(
+        "--awp_eta",
+        type=float,
+        default=1e-3,
+        help="AWP eta added to |w| when building the relative perturbation scale.",
+    )
     parser.add_argument("--optimizer", type=str, choices=["adamw", "sgd"], default="adamw")
     parser.add_argument("--sgd_momentum", type=float, default=0.9)
 
@@ -421,6 +683,24 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="If > 0, only optimize selected buckets in the last N transformer layers (plus output head when selected).",
     )
+    parser.add_argument(
+        "--teacher_generated_ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of batches replaced by clean-teacher generated prefixes.",
+    )
+    parser.add_argument(
+        "--teacher_generated_prompt_len",
+        type=int,
+        default=64,
+        help="Prompt length used when building teacher-generated training sequences.",
+    )
+    parser.add_argument(
+        "--teacher_generated_top_k",
+        type=int,
+        default=1,
+        help="Top-k used for teacher-generated sequences (1 = greedy).",
+    )
 
     parser.add_argument("--save_interval", type=int, default=50, help="Save intermediate checkpoint every N steps (0 disables).")
     parser.add_argument("--save_dir", type=Path, default=Path("out/finetune_qwen3_0p6b_wikitext_noise"))
@@ -451,8 +731,38 @@ def main() -> None:
         raise ValueError("--noisy_ce_weight, --consistency_weight, and --distill_kl_weight must be >= 0")
     if float(args.distill_temperature) <= 0:
         raise ValueError("--distill_temperature must be > 0")
+    if float(args.acceptance_keep_ratio) <= 0 or float(args.acceptance_keep_ratio) > 1:
+        raise ValueError("--acceptance_keep_ratio must be in (0, 1]")
+    if int(args.acceptance_topk) <= 0:
+        raise ValueError("--acceptance_topk must be >= 1")
+    if float(args.acceptance_tau) <= 0:
+        raise ValueError("--acceptance_tau must be > 0")
+    if float(args.asam_rho) < 0:
+        raise ValueError("--asam_rho must be >= 0")
+    if float(args.asam_eta) <= 0:
+        raise ValueError("--asam_eta must be > 0")
+    if float(args.awp_lr) < 0 or float(args.awp_eps) < 0:
+        raise ValueError("--awp_lr and --awp_eps must be >= 0")
+    if float(args.awp_eta) <= 0:
+        raise ValueError("--awp_eta must be > 0")
+    if float(args.teacher_generated_ratio) < 0 or float(args.teacher_generated_ratio) > 1:
+        raise ValueError("--teacher_generated_ratio must be in [0, 1]")
+    if int(args.teacher_generated_prompt_len) <= 0:
+        raise ValueError("--teacher_generated_prompt_len must be >= 1")
+    if int(args.teacher_generated_top_k) <= 0:
+        raise ValueError("--teacher_generated_top_k must be >= 1")
     if int(args.train_last_n_layers) < 0:
         raise ValueError("--train_last_n_layers must be >= 0")
+    if float(args.asam_rho) > 0 and int(args.grad_accum_steps) != 1:
+        raise ValueError("Current ASAM implementation requires --grad_accum_steps 1.")
+    if float(args.awp_lr) > 0 and int(args.grad_accum_steps) != 1:
+        raise ValueError("Current AWP implementation requires --grad_accum_steps 1.")
+    if float(args.asam_rho) > 0 and float(args.awp_lr) > 0:
+        raise ValueError("Use either ASAM or AWP in one run, not both.")
+    if float(args.teacher_generated_ratio) > 0 and int(args.batch_size) != 1:
+        raise ValueError("Current teacher-generated-prefix implementation requires --batch_size 1.")
+    if int(args.teacher_generated_prompt_len) >= int(args.seq_len) + 1:
+        raise ValueError("--teacher_generated_prompt_len must be < seq_len + 1")
 
     torch.manual_seed(int(args.seed))
     random.seed(int(args.seed))
@@ -475,8 +785,7 @@ def main() -> None:
         model.setup_caches(max_batch_size=int(args.batch_size), max_seq_length=int(args.seq_len))
     # For full-sequence training we do not use autoregressive KV caching across steps.
     # Keeping kv_cache tensors attached to previous-step graphs can break backward.
-    for layer in model.layers:
-        layer.attention.kv_cache = None
+    _disable_kv_cache_(model)
     input_pos = torch.arange(0, int(args.seq_len), device=args.device, dtype=torch.int64)
     trainable_stats = _set_trainable_params_(
         model,
@@ -494,8 +803,7 @@ def main() -> None:
         teacher.eval()
         with torch.device(teacher_device):
             teacher.setup_caches(max_batch_size=int(args.batch_size), max_seq_length=int(args.seq_len))
-        for layer in teacher.layers:
-            layer.attention.kv_cache = None
+        _disable_kv_cache_(teacher)
         teacher_input_pos = torch.arange(0, int(args.seq_len), device=teacher_device, dtype=torch.int64)
 
     write_noise_stds = _coerce_write_noise_stds(args.write_noise_std)
@@ -536,7 +844,8 @@ def main() -> None:
         add_eos=True,
     )
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+    trainable_params = [p for _, p in trainable_named_params]
     if len(trainable_params) == 0:
         raise ValueError("No trainable parameters selected. Adjust --train_buckets / --train_last_n_layers.")
 
@@ -559,6 +868,7 @@ def main() -> None:
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
     mode_counts = {"clean": 0, "write": 0, "read": 0, "both": 0}
+    teacher_generated_batches = 0
     tokens_per_step = int(args.batch_size) * int(args.seq_len) * int(args.grad_accum_steps)
     train_start = time.perf_counter()
 
@@ -597,6 +907,32 @@ def main() -> None:
             noise_seed = int(args.seed) + attempt * 100003 + micro
             try:
                 x, y = train_stream.next_batch(batch_size=int(args.batch_size), seq_len=int(args.seq_len), device=args.device)
+                if teacher is not None and float(args.teacher_generated_ratio) > 0 and mode_rng.random() < float(args.teacher_generated_ratio):
+                    prompt_len = int(args.teacher_generated_prompt_len)
+                    teacher_prompt = x[:, :prompt_len].to(teacher_device).reshape(-1)
+                    gen_len = int(args.seq_len) + 1 - prompt_len
+                    teacher.max_batch_size = -1
+                    teacher.max_seq_length = -1
+                    with torch.device(teacher_device):
+                        teacher.setup_caches(max_batch_size=1, max_seq_length=int(args.seq_len) + 1)
+                    with torch.no_grad():
+                        generated_seq, _ = g.generate(
+                            teacher,
+                            teacher_prompt,
+                            gen_len,
+                            batch_size=1,
+                            draft_model=None,
+                            speculate_k=1,
+                            interactive=False,
+                            callback=lambda _: None,
+                            temperature=0.0,
+                            top_k=int(args.teacher_generated_top_k),
+                        )
+                    full_seq = generated_seq[0, : int(args.seq_len) + 1].to(args.device, dtype=torch.long)
+                    x = full_seq[:-1].view(1, -1)
+                    y = full_seq[1:].view(1, -1)
+                    teacher_generated_batches += 1
+                    _disable_kv_cache_(teacher)
                 clean_targets: Optional[torch.Tensor] = None
                 clean_teacher_logits: Optional[torch.Tensor] = None
                 if needs_clean_teacher:
@@ -623,48 +959,111 @@ def main() -> None:
                     bad_step = True
                     bad_reason = "nonfinite_logits"
                     break
-                main_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1))
-                if not torch.isfinite(main_loss):
-                    bad_step = True
-                    bad_reason = "nonfinite_loss"
-                    break
-                total_loss = float(args.noisy_ce_weight) * main_loss
-
-                cons_loss_val = 0.0
-                if clean_targets is not None and float(args.consistency_weight) > 0:
-                    cons_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), clean_targets.reshape(-1))
-                    if not torch.isfinite(cons_loss):
-                        bad_step = True
-                        bad_reason = "nonfinite_consistency_loss"
-                        break
-                    total_loss = total_loss + float(args.consistency_weight) * cons_loss
-                    cons_loss_val = float(cons_loss.item())
-
-                distill_loss_val = 0.0
-                if clean_teacher_logits is not None and float(args.distill_kl_weight) > 0:
-                    temp = float(args.distill_temperature)
-                    student_log_probs = F.log_softmax(
-                        logits.float().reshape(-1, logits.size(-1)) / temp,
-                        dim=-1,
+                try:
+                    total_loss, main_loss, cons_loss_val, distill_loss_val = _compute_student_losses(
+                        logits=logits,
+                        y=y,
+                        clean_targets=clean_targets,
+                        clean_teacher_logits=clean_teacher_logits,
+                        noisy_ce_weight=float(args.noisy_ce_weight),
+                        consistency_weight=float(args.consistency_weight),
+                        distill_kl_weight=float(args.distill_kl_weight),
+                        distill_temperature=float(args.distill_temperature),
+                        acceptance_weight_mode=str(args.acceptance_weight_mode),
+                        acceptance_topk=int(args.acceptance_topk),
+                        acceptance_keep_ratio=float(args.acceptance_keep_ratio),
+                        acceptance_tau=float(args.acceptance_tau),
                     )
-                    teacher_probs = F.softmax(
-                        clean_teacher_logits.float().reshape(-1, clean_teacher_logits.size(-1)) / temp,
-                        dim=-1,
-                    )
-                    distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temp * temp)
-                    if not torch.isfinite(distill_loss):
-                        bad_step = True
-                        bad_reason = "nonfinite_distill_loss"
-                        break
-                    total_loss = total_loss + float(args.distill_kl_weight) * distill_loss
-                    distill_loss_val = float(distill_loss.item())
-
-                if not torch.isfinite(total_loss):
+                except ValueError as exc:
                     bad_step = True
-                    bad_reason = "nonfinite_total_loss"
+                    bad_reason = str(exc)
                     break
 
-                (total_loss / float(args.grad_accum_steps)).backward()
+                if float(args.asam_rho) > 0:
+                    total_loss.backward()
+                    grad_norm, grads_finite = _grad_norm_and_finite(model)
+                    if (not grads_finite) or (not math.isfinite(grad_norm)):
+                        bad_step = True
+                        bad_reason = "nonfinite_grad"
+                        break
+                    eps_by_name = _asam_ascent_(
+                        trainable_named_params,
+                        rho=float(args.asam_rho),
+                        eta=float(args.asam_eta),
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    logits = g.model_forward(model, x, input_pos)
+                    if not torch.isfinite(logits).all():
+                        bad_step = True
+                        bad_reason = "nonfinite_logits_asam"
+                        _asam_restore_(trainable_named_params, eps_by_name)
+                        break
+                    try:
+                        total_loss, main_loss, cons_loss_val, distill_loss_val = _compute_student_losses(
+                            logits=logits,
+                            y=y,
+                            clean_targets=clean_targets,
+                            clean_teacher_logits=clean_teacher_logits,
+                            noisy_ce_weight=float(args.noisy_ce_weight),
+                            consistency_weight=float(args.consistency_weight),
+                            distill_kl_weight=float(args.distill_kl_weight),
+                            distill_temperature=float(args.distill_temperature),
+                            acceptance_weight_mode=str(args.acceptance_weight_mode),
+                            acceptance_topk=int(args.acceptance_topk),
+                            acceptance_keep_ratio=float(args.acceptance_keep_ratio),
+                            acceptance_tau=float(args.acceptance_tau),
+                        )
+                    except ValueError as exc:
+                        bad_step = True
+                        bad_reason = f"{exc}_asam"
+                        _asam_restore_(trainable_named_params, eps_by_name)
+                        break
+                    (total_loss / float(args.grad_accum_steps)).backward()
+                    _asam_restore_(trainable_named_params, eps_by_name)
+                elif float(args.awp_lr) > 0 and float(args.awp_eps) > 0:
+                    total_loss.backward()
+                    grad_norm, grads_finite = _grad_norm_and_finite(model)
+                    if (not grads_finite) or (not math.isfinite(grad_norm)):
+                        bad_step = True
+                        bad_reason = "nonfinite_grad"
+                        break
+                    delta_by_name = _awp_ascent_(
+                        trainable_named_params,
+                        adv_lr=float(args.awp_lr),
+                        adv_eps=float(args.awp_eps),
+                        eta=float(args.awp_eta),
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    logits = g.model_forward(model, x, input_pos)
+                    if not torch.isfinite(logits).all():
+                        bad_step = True
+                        bad_reason = "nonfinite_logits_awp"
+                        _awp_restore_(trainable_named_params, delta_by_name)
+                        break
+                    try:
+                        total_loss, main_loss, cons_loss_val, distill_loss_val = _compute_student_losses(
+                            logits=logits,
+                            y=y,
+                            clean_targets=clean_targets,
+                            clean_teacher_logits=clean_teacher_logits,
+                            noisy_ce_weight=float(args.noisy_ce_weight),
+                            consistency_weight=float(args.consistency_weight),
+                            distill_kl_weight=float(args.distill_kl_weight),
+                            distill_temperature=float(args.distill_temperature),
+                            acceptance_weight_mode=str(args.acceptance_weight_mode),
+                            acceptance_topk=int(args.acceptance_topk),
+                            acceptance_keep_ratio=float(args.acceptance_keep_ratio),
+                            acceptance_tau=float(args.acceptance_tau),
+                        )
+                    except ValueError as exc:
+                        bad_step = True
+                        bad_reason = f"{exc}_awp"
+                        _awp_restore_(trainable_named_params, delta_by_name)
+                        break
+                    (total_loss / float(args.grad_accum_steps)).backward()
+                    _awp_restore_(trainable_named_params, delta_by_name)
+                else:
+                    (total_loss / float(args.grad_accum_steps)).backward()
                 accum_main_loss += float(main_loss.item())
                 accum_cons_loss += cons_loss_val
                 accum_distill_loss += distill_loss_val
@@ -756,6 +1155,15 @@ def main() -> None:
         "consistency_weight": float(args.consistency_weight),
         "distill_kl_weight": float(args.distill_kl_weight),
         "distill_temperature": float(args.distill_temperature),
+        "acceptance_weight_mode": str(args.acceptance_weight_mode),
+        "acceptance_topk": int(args.acceptance_topk),
+        "acceptance_keep_ratio": float(args.acceptance_keep_ratio),
+        "acceptance_tau": float(args.acceptance_tau),
+        "asam_rho": float(args.asam_rho),
+        "asam_eta": float(args.asam_eta),
+        "awp_lr": float(args.awp_lr),
+        "awp_eps": float(args.awp_eps),
+        "awp_eta": float(args.awp_eta),
         "train_parquet": [str(p) for p in args.train_parquet],
         "val_parquet": [str(p) for p in args.val_parquet],
         "steps": int(step),
@@ -765,12 +1173,16 @@ def main() -> None:
         "tokens_per_step": int(tokens_per_step),
         "elapsed_sec": float(elapsed),
         "mode_counts": {k: int(v) for k, v in mode_counts.items()},
+        "teacher_generated_batches": int(teacher_generated_batches),
         "write_noise_stds": write_noise_stds,
         "read_noise_std": float(read_noise_std),
         "mode_probs": dict(zip(mode_dist.names, mode_dist.probs)),
         "train_buckets": None if args.train_buckets is None else [str(x) for x in args.train_buckets],
         "train_last_n_layers": int(args.train_last_n_layers),
         "trainable_stats": {k: int(v) for k, v in trainable_stats.items()},
+        "teacher_generated_ratio": float(args.teacher_generated_ratio),
+        "teacher_generated_prompt_len": int(args.teacher_generated_prompt_len),
+        "teacher_generated_top_k": int(args.teacher_generated_top_k),
     }
     summary_path = args.save_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
