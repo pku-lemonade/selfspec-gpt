@@ -416,6 +416,25 @@ def _coerce_draft_noise_stds(draft_noise_std: Union[float, Sequence[float]]) -> 
     raise ValueError("draft_noise_std must be 1 value or 3 values (FFN QKV OUT)")
 
 
+def _resolve_interface_quant_bits(
+    *,
+    explicit_bits: int,
+    legacy_bits: int,
+    label: str,
+) -> int:
+    explicit_bits = int(explicit_bits)
+    legacy_bits = int(legacy_bits)
+    if explicit_bits and legacy_bits and explicit_bits != legacy_bits:
+        raise ValueError(
+            f"Conflicting {label} quantization settings: explicit={explicit_bits} legacy={legacy_bits}. "
+            "Use only one style or provide matching values."
+        )
+    bits = explicit_bits or legacy_bits
+    if bits < 0:
+        raise ValueError(f"{label} quantization bits must be >= 0")
+    return bits
+
+
 @torch.no_grad()
 def add_gaussian_noise_to_draft_weights_(
     model: Transformer,
@@ -514,6 +533,8 @@ def main(
     draft_dequantize_int8: bool = False,
     draft_fake_act_quant_int8: bool = False,
     int8_act_quant: bool = False,
+    verify_adc_bits: int = 0,
+    draft_adc_bits: int = 0,
     post_matmul_quant_bits: int = 0,
     draft_post_matmul_quant_bits: int = 0,
     speculate_k: int = 5,
@@ -566,10 +587,21 @@ def main(
     t0 = time.time()
     model = _load_model(checkpoint_path, device, precision, use_tp, int8_act_quant=int8_act_quant)
 
-    if post_matmul_quant_bits:
+    verify_quant_bits = _resolve_interface_quant_bits(
+        explicit_bits=verify_adc_bits,
+        legacy_bits=post_matmul_quant_bits,
+        label="verify ADC/interface",
+    )
+    draft_quant_bits = _resolve_interface_quant_bits(
+        explicit_bits=draft_adc_bits,
+        legacy_bits=draft_post_matmul_quant_bits,
+        label="draft ADC/interface",
+    )
+
+    if verify_quant_bits:
         from quantize import set_post_matmul_output_quant_bits
 
-        set_post_matmul_output_quant_bits(model, post_matmul_quant_bits)
+        set_post_matmul_output_quant_bits(model, verify_quant_bits)
 
     if is_speculative:
         if draft_dequantize_int8:
@@ -625,10 +657,10 @@ def main(
             )
             print(f"Noised params (numel): ffn={counts['ffn']}, qkv={counts['qkv']}, out={counts['out']}")
 
-        if draft_post_matmul_quant_bits:
+        if draft_quant_bits:
             from quantize import set_post_matmul_output_quant_bits
 
-            set_post_matmul_output_quant_bits(draft_model, draft_post_matmul_quant_bits)
+            set_post_matmul_output_quant_bits(draft_model, draft_quant_bits)
     else:
         draft_model = None
 
@@ -802,6 +834,8 @@ def main(
                     "draft_dequantize_int8": bool(draft_dequantize_int8),
                     "draft_fake_act_quant_int8": bool(draft_fake_act_quant_int8),
                     "int8_act_quant": bool(int8_act_quant),
+                    "verify_adc_bits": int(verify_quant_bits),
+                    "draft_adc_bits": int(draft_quant_bits),
                     "post_matmul_quant_bits": int(post_matmul_quant_bits),
                     "draft_post_matmul_quant_bits": int(draft_post_matmul_quant_bits),
                     "compile": bool(compile),
@@ -883,16 +917,28 @@ if __name__ == '__main__':
         help='If set (and checkpoint is int8), quantize activations per-token and run int8xint8 matmuls for linear layers (target model).',
     )
     parser.add_argument(
+        '--verify_adc_bits',
+        type=int,
+        default=0,
+        help='ADC-style interface quantization bits for the verify/target analog linear outputs. 0 disables.',
+    )
+    parser.add_argument(
+        '--draft_adc_bits',
+        type=int,
+        default=0,
+        help='ADC-style interface quantization bits for the draft analog linear outputs. 0 disables.',
+    )
+    parser.add_argument(
         '--post_matmul_quant_bits',
         type=int,
         default=0,
-        help='If non-zero, fake-quantize the output of each linear matmul per token to this many bits (supported: 8, 16).',
+        help='Legacy alias for verify ADC/interface quantization bits on analog linear outputs.',
     )
     parser.add_argument(
         '--draft_post_matmul_quant_bits',
         type=int,
         default=0,
-        help='Same as --post_matmul_quant_bits but applied to the draft model.',
+        help='Legacy alias for draft ADC/interface quantization bits on analog linear outputs.',
     )
     parser.add_argument(
         '--draft_noise_std',
@@ -955,6 +1001,8 @@ if __name__ == '__main__':
         args.draft_dequantize_int8,
         args.draft_fake_act_quant_int8,
         args.int8_act_quant,
+        args.verify_adc_bits,
+        args.draft_adc_bits,
         args.post_matmul_quant_bits,
         args.draft_post_matmul_quant_bits,
         args.speculate_k,

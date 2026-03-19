@@ -257,16 +257,28 @@ def main() -> None:
         help="If set (and checkpoint is int8), quantize activations per-token and run int8xint8 matmuls for linear layers (target model).",
     )
     parser.add_argument(
+        "--verify_adc_bits",
+        type=int,
+        default=0,
+        help="ADC-style interface quantization bits for the target/verify analog linear outputs. 0 disables.",
+    )
+    parser.add_argument(
+        "--draft_adc_bits",
+        type=int,
+        default=0,
+        help="ADC-style interface quantization bits for the draft analog linear outputs. 0 disables.",
+    )
+    parser.add_argument(
         "--post_matmul_quant_bits",
         type=int,
         default=0,
-        help="If non-zero, fake-quantize the output of each linear matmul per token to this many bits (supported: 8, 16).",
+        help="Legacy alias for verify ADC/interface quantization bits on analog linear outputs.",
     )
     parser.add_argument(
         "--draft_post_matmul_quant_bits",
         type=int,
         default=0,
-        help="Same as --post_matmul_quant_bits but applied to the draft model.",
+        help="Legacy alias for draft ADC/interface quantization bits on analog linear outputs.",
     )
     parser.add_argument(
         "--read_noise_std",
@@ -310,11 +322,22 @@ def main() -> None:
     set_read_noise_std(float(args.read_noise_std))
 
     precision = torch.bfloat16
+    verify_quant_bits = g._resolve_interface_quant_bits(
+        explicit_bits=int(args.verify_adc_bits),
+        legacy_bits=int(args.post_matmul_quant_bits),
+        label="verify ADC/interface",
+    )
+    draft_quant_bits = g._resolve_interface_quant_bits(
+        explicit_bits=int(args.draft_adc_bits),
+        legacy_bits=int(args.draft_post_matmul_quant_bits),
+        label="draft ADC/interface",
+    )
+
     model = g._load_model(args.checkpoint_path, args.device, precision, use_tp=False, int8_act_quant=bool(args.int8_act_quant))
-    if args.post_matmul_quant_bits:
+    if verify_quant_bits:
         from quantize import set_post_matmul_output_quant_bits
 
-        set_post_matmul_output_quant_bits(model, int(args.post_matmul_quant_bits))
+        set_post_matmul_output_quant_bits(model, int(verify_quant_bits))
 
     if args.draft_dequantize_int8:
         draft_model = g._load_int8_weight_only_as_fp_model(args.draft_checkpoint_path, draft_device, precision, use_tp=False)
@@ -325,10 +348,10 @@ def main() -> None:
         from quantize import replace_linear_fake_act_quant
 
         replace_linear_fake_act_quant(draft_model)
-    if args.draft_post_matmul_quant_bits:
+    if draft_quant_bits:
         from quantize import set_post_matmul_output_quant_bits
 
-        set_post_matmul_output_quant_bits(draft_model, int(args.draft_post_matmul_quant_bits))
+        set_post_matmul_output_quant_bits(draft_model, int(draft_quant_bits))
 
     # Optional draft noise after load.
     n_layer = len(draft_model.layers)
@@ -413,6 +436,8 @@ def main() -> None:
                 "draft_dequantize_int8": bool(args.draft_dequantize_int8),
                 "draft_fake_act_quant_int8": bool(args.draft_fake_act_quant_int8),
                 "int8_act_quant": bool(args.int8_act_quant),
+                "verify_adc_bits": int(verify_quant_bits),
+                "draft_adc_bits": int(draft_quant_bits),
                 "post_matmul_quant_bits": int(args.post_matmul_quant_bits),
                 "draft_post_matmul_quant_bits": int(args.draft_post_matmul_quant_bits),
                 "device": str(args.device),
@@ -496,6 +521,8 @@ def main() -> None:
                 "draft_dequantize_int8": bool(args.draft_dequantize_int8),
                 "draft_fake_act_quant_int8": bool(args.draft_fake_act_quant_int8),
                 "int8_act_quant": bool(args.int8_act_quant),
+                "verify_adc_bits": int(verify_quant_bits),
+                "draft_adc_bits": int(draft_quant_bits),
                 "post_matmul_quant_bits": int(args.post_matmul_quant_bits),
                 "draft_post_matmul_quant_bits": int(args.draft_post_matmul_quant_bits),
                 "device": str(args.device),

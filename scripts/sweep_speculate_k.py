@@ -91,8 +91,10 @@ def main() -> None:
     parser.add_argument("--draft_dequantize_int8", action="store_true")
     parser.add_argument("--draft_fake_act_quant_int8", action="store_true")
     parser.add_argument("--int8_act_quant", action="store_true")
-    parser.add_argument("--post_matmul_quant_bits", type=int, default=0)
-    parser.add_argument("--draft_post_matmul_quant_bits", type=int, default=0)
+    parser.add_argument("--verify_adc_bits", type=int, default=0, help="ADC-style interface quantization bits for target/verify analog linear outputs. 0 disables.")
+    parser.add_argument("--draft_adc_bits", type=int, default=0, help="ADC-style interface quantization bits for draft analog linear outputs. 0 disables.")
+    parser.add_argument("--post_matmul_quant_bits", type=int, default=0, help="Legacy alias for verify ADC/interface quantization bits.")
+    parser.add_argument("--draft_post_matmul_quant_bits", type=int, default=0, help="Legacy alias for draft ADC/interface quantization bits.")
 
     parser.add_argument("--run_id", type=str, default=None, help="Optional run id used in the output path.")
     parser.add_argument("--out_json", type=Path, default=None, help="Optional explicit output JSON path.")
@@ -126,11 +128,22 @@ def main() -> None:
 
     precision = torch.bfloat16
     tokenizer = get_tokenizer(tokenizer_path, args.checkpoint_path)
+    verify_quant_bits = g._resolve_interface_quant_bits(
+        explicit_bits=int(args.verify_adc_bits),
+        legacy_bits=int(args.post_matmul_quant_bits),
+        label="verify ADC/interface",
+    )
+    draft_quant_bits = g._resolve_interface_quant_bits(
+        explicit_bits=int(args.draft_adc_bits),
+        legacy_bits=int(args.draft_post_matmul_quant_bits),
+        label="draft ADC/interface",
+    )
+
     target = g._load_model(args.checkpoint_path, args.device, precision, use_tp=False, int8_act_quant=bool(args.int8_act_quant))
-    if args.post_matmul_quant_bits:
+    if verify_quant_bits:
         from quantize import set_post_matmul_output_quant_bits
 
-        set_post_matmul_output_quant_bits(target, int(args.post_matmul_quant_bits))
+        set_post_matmul_output_quant_bits(target, int(verify_quant_bits))
 
     if args.draft_dequantize_int8:
         draft = g._load_int8_weight_only_as_fp_model(draft_checkpoint_path, args.draft_device, precision, use_tp=False)
@@ -140,10 +153,10 @@ def main() -> None:
         from quantize import replace_linear_fake_act_quant
 
         replace_linear_fake_act_quant(draft)
-    if args.draft_post_matmul_quant_bits:
+    if draft_quant_bits:
         from quantize import set_post_matmul_output_quant_bits
 
-        set_post_matmul_output_quant_bits(draft, int(args.draft_post_matmul_quant_bits))
+        set_post_matmul_output_quant_bits(draft, int(draft_quant_bits))
 
     use_levels = (args.draft_noise_levels is not None) or (args.draft_noise_level_stds is not None)
     if use_levels:
@@ -195,6 +208,10 @@ def main() -> None:
             "draft_noise_level_stds": None if args.draft_noise_level_stds is None else [float(x) for x in args.draft_noise_level_stds],
             "draft_noise_levels": None if args.draft_noise_levels is None else [int(x) for x in args.draft_noise_levels],
             "draft_noise_seed": int(args.draft_noise_seed),
+            "verify_adc_bits": int(verify_quant_bits),
+            "draft_adc_bits": int(draft_quant_bits),
+            "post_matmul_quant_bits": int(args.post_matmul_quant_bits),
+            "draft_post_matmul_quant_bits": int(args.draft_post_matmul_quant_bits),
         },
         "results_by_k": {},
     }

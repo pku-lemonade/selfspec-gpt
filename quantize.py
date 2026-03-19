@@ -480,8 +480,8 @@ def set_post_matmul_output_quant_bits(module: torch.nn.Module, bits: int) -> Non
     bits = int(bits)
     if bits == 0:
         return
-    if bits not in (8, 16):
-        raise ValueError("post-matmul quantization bits must be one of: 0, 8, 16")
+    if bits < 2 or bits > 16:
+        raise ValueError("post-matmul quantization bits must be 0 or an integer in [2, 16]")
 
     for child in module.modules():
         if hasattr(child, "output_quant_bits"):
