@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import generate as g
 from model import set_attention_backend, set_read_noise_std
 from tokenizer import get_tokenizer, resolve_tokenizer_path
+from quantize import set_post_matmul_output_quant_bits
 
 DEFAULT_CUDA_DEVICE = (
     "cuda:1"
@@ -664,6 +665,18 @@ def parse_args() -> argparse.Namespace:
         default=1e-4,
         help="Relative read noise std (multiplicative) used in read/both modes.",
     )
+    parser.add_argument(
+        "--student_adc_bits",
+        type=int,
+        default=0,
+        help="ADC-style interface quantization bits applied to the student model's analog linear outputs during training. 0 disables.",
+    )
+    parser.add_argument(
+        "--teacher_adc_bits",
+        type=int,
+        default=0,
+        help="ADC-style interface quantization bits applied to the frozen teacher model during distillation. 0 disables.",
+    )
 
     parser.add_argument("--prob_clean", type=float, default=0.25, help="Sampling probability weight for clean mode.")
     parser.add_argument("--prob_write", type=float, default=0.25, help="Sampling probability weight for write-only mode.")
@@ -751,6 +764,8 @@ def main() -> None:
         raise ValueError("--teacher_generated_prompt_len must be >= 1")
     if int(args.teacher_generated_top_k) <= 0:
         raise ValueError("--teacher_generated_top_k must be >= 1")
+    if int(args.student_adc_bits) < 0 or int(args.teacher_adc_bits) < 0:
+        raise ValueError("--student_adc_bits and --teacher_adc_bits must be >= 0")
     if int(args.train_last_n_layers) < 0:
         raise ValueError("--train_last_n_layers must be >= 0")
     if float(args.asam_rho) > 0 and int(args.grad_accum_steps) != 1:
@@ -780,6 +795,8 @@ def main() -> None:
 
     print(f"Loading model from {args.checkpoint_path} on {args.device}")
     model = g._load_model(args.checkpoint_path, args.device, precision, use_tp=False)
+    if int(args.student_adc_bits) > 0:
+        set_post_matmul_output_quant_bits(model, int(args.student_adc_bits))
     model.train()
     with torch.device(args.device):
         model.setup_caches(max_batch_size=int(args.batch_size), max_seq_length=int(args.seq_len))
@@ -800,6 +817,8 @@ def main() -> None:
         teacher_device = args.teacher_device or args.device
         print(f"Loading frozen teacher from {args.teacher_checkpoint_path} on {teacher_device}")
         teacher = g._load_model(args.teacher_checkpoint_path, teacher_device, precision, use_tp=False)
+        if int(args.teacher_adc_bits) > 0:
+            set_post_matmul_output_quant_bits(teacher, int(args.teacher_adc_bits))
         teacher.eval()
         with torch.device(teacher_device):
             teacher.setup_caches(max_batch_size=int(args.batch_size), max_seq_length=int(args.seq_len))
@@ -828,6 +847,7 @@ def main() -> None:
     )
     print(f"Noise mix probs: {dict(zip(mode_dist.names, mode_dist.probs))}")
     print(f"Write noise stds: {write_noise_stds}, read noise std: {read_noise_std}")
+    print(f"ADC bits: student={int(args.student_adc_bits)}, teacher={int(args.teacher_adc_bits)}")
 
     train_stream = ParquetTokenStream(
         parquet_paths=args.train_parquet,
@@ -1176,6 +1196,8 @@ def main() -> None:
         "teacher_generated_batches": int(teacher_generated_batches),
         "write_noise_stds": write_noise_stds,
         "read_noise_std": float(read_noise_std),
+        "student_adc_bits": int(args.student_adc_bits),
+        "teacher_adc_bits": int(args.teacher_adc_bits),
         "mode_probs": dict(zip(mode_dist.names, mode_dist.probs)),
         "train_buckets": None if args.train_buckets is None else [str(x) for x in args.train_buckets],
         "train_last_n_layers": int(args.train_last_n_layers),

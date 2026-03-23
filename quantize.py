@@ -445,6 +445,37 @@ class FakeActQuantLinear(torch.nn.Module):
         return out
 
 
+class FpOutputQuantLinear(torch.nn.Module):
+    __constants__ = ["in_features", "out_features"]
+    in_features: int
+    out_features: int
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+        self.in_features = int(linear.in_features)
+        self.out_features = int(linear.out_features)
+        self.weight = linear.weight
+        if linear.bias is None:
+            self.bias = None
+        else:
+            self.bias = linear.bias
+        self.output_quant_bits = 0
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        out = F.linear(input, self.weight, self.bias)
+        if self.output_quant_bits:
+            out = fake_quantize_per_token_symmetric(out, bits=int(self.output_quant_bits))
+        return out
+
+
+def replace_linear_fp_output_quant(module: torch.nn.Module) -> None:
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            setattr(module, name, FpOutputQuantLinear(child))
+        else:
+            replace_linear_fp_output_quant(child)
+
+
 def replace_linear_fake_act_quant(module):
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
@@ -458,8 +489,8 @@ def fake_quantize_per_token_symmetric(x: torch.Tensor, *, bits: int, eps: float 
         return x
     if not x.is_floating_point():
         return x
-    if bits not in (8, 16):
-        raise ValueError("bits must be one of: 0, 8, 16")
+    if bits < 2 or bits > 16:
+        raise ValueError("bits must be an integer in [2, 16]")
 
     qmin = -(1 << (bits - 1))
     qmax = (1 << (bits - 1)) - 1
@@ -483,6 +514,7 @@ def set_post_matmul_output_quant_bits(module: torch.nn.Module, bits: int) -> Non
     if bits < 2 or bits > 16:
         raise ValueError("post-matmul quantization bits must be 0 or an integer in [2, 16]")
 
+    replace_linear_fp_output_quant(module)
     for child in module.modules():
         if hasattr(child, "output_quant_bits"):
             child.output_quant_bits = bits
