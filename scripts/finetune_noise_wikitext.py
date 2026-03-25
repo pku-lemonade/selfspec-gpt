@@ -22,7 +22,12 @@ sys.path.insert(0, str(REPO_ROOT))
 import generate as g
 from model import set_attention_backend, set_read_noise_std
 from tokenizer import get_tokenizer, resolve_tokenizer_path
-from quantize import set_post_matmul_output_quant_bits
+from quantize import (
+    set_post_matmul_output_quant_bits,
+    set_post_matmul_output_quant_clip_scale,
+    set_post_matmul_output_quant_psum_mode,
+    set_post_matmul_output_quant_stochastic_mode,
+)
 
 DEFAULT_CUDA_DEVICE = (
     "cuda:1"
@@ -304,6 +309,33 @@ def _grad_norm_and_finite(model: torch.nn.Module) -> Tuple[float, bool]:
 
 
 @torch.no_grad()
+def _grad_norm_and_finite_with_extra(
+    model: torch.nn.Module,
+    *,
+    extra_params: Optional[Sequence[torch.nn.Parameter]] = None,
+) -> Tuple[float, bool]:
+    norms: List[torch.Tensor] = []
+    for p in model.parameters():
+        g = p.grad
+        if g is None:
+            continue
+        if not torch.isfinite(g).all():
+            return float("nan"), False
+        norms.append(torch.linalg.vector_norm(g.float(), ord=2))
+    for p in extra_params or ():
+        g = p.grad
+        if g is None:
+            continue
+        if not torch.isfinite(g).all():
+            return float("nan"), False
+        norms.append(torch.linalg.vector_norm(g.float(), ord=2))
+    if len(norms) == 0:
+        return 0.0, True
+    total = torch.linalg.vector_norm(torch.stack(norms), ord=2)
+    return float(total.item()), bool(torch.isfinite(total).item())
+
+
+@torch.no_grad()
 def _compute_acceptance_weights(
     *,
     student_logits: torch.Tensor,
@@ -416,6 +448,47 @@ def _compute_student_losses(
     return total_loss, main_loss, cons_loss_val, distill_loss_val
 
 
+def _compute_weight_compactness_loss(
+    named_params: Sequence[Tuple[str, torch.nn.Parameter]],
+    *,
+    rms_mult: float,
+) -> Optional[torch.Tensor]:
+    penalties: List[torch.Tensor] = []
+    for name, param in named_params:
+        if not name.endswith("weight"):
+            continue
+        if not param.is_floating_point():
+            continue
+        w = param.float()
+        rms = torch.sqrt(torch.mean(w * w).detach() + 1e-8)
+        excess = torch.relu(w.abs() - float(rms_mult) * rms)
+        penalties.append(torch.mean((excess / rms.clamp_min(1e-8)) ** 2))
+    if len(penalties) == 0:
+        return None
+    return torch.stack(penalties).mean()
+
+
+def _apply_regularizers_(
+    *,
+    total_loss: torch.Tensor,
+    trainable_named_params: Sequence[Tuple[str, torch.nn.Parameter]],
+    weight_compactness_weight: float,
+    weight_compactness_rms_mult: float,
+) -> Tuple[torch.Tensor, float]:
+    compactness_loss_val = 0.0
+    if float(weight_compactness_weight) > 0:
+        compactness_loss = _compute_weight_compactness_loss(
+            trainable_named_params,
+            rms_mult=float(weight_compactness_rms_mult),
+        )
+        if compactness_loss is not None:
+            if not torch.isfinite(compactness_loss):
+                raise ValueError("nonfinite_weight_compactness_loss")
+            total_loss = total_loss + float(weight_compactness_weight) * compactness_loss
+            compactness_loss_val = float(compactness_loss.item())
+    return total_loss, compactness_loss_val
+
+
 @torch.no_grad()
 def _asam_ascent_(
     named_params: Sequence[Tuple[str, torch.nn.Parameter]],
@@ -519,6 +592,20 @@ def _scale_grads_(model: torch.nn.Module, scale: float) -> None:
 
 
 @torch.no_grad()
+def _scale_grads_with_extra_(
+    model: torch.nn.Module,
+    scale: float,
+    *,
+    extra_params: Optional[Sequence[torch.nn.Parameter]] = None,
+) -> None:
+    _scale_grads_(model, scale)
+    s = float(scale)
+    for p in extra_params or ():
+        if p.grad is not None:
+            p.grad.mul_(s)
+
+
+@torch.no_grad()
 def _evaluate_clean_loss(
     *,
     model: torch.nn.Module,
@@ -530,15 +617,24 @@ def _evaluate_clean_loss(
 ) -> float:
     model.eval()
     set_read_noise_std(0.0)
+    output_quant_snapshot: List[Tuple[torch.nn.Module, int]] = []
+    for child in model.modules():
+        if hasattr(child, "output_quant_bits"):
+            output_quant_snapshot.append((child, int(child.output_quant_bits)))
+            child.output_quant_bits = 0
     val_stream.reset()
     input_pos = torch.arange(0, seq_len, device=device, dtype=torch.int64)
     losses: List[float] = []
-    for _ in range(int(eval_steps)):
-        x, y = val_stream.next_batch(batch_size=batch_size, seq_len=seq_len, device=device)
-        logits = g.model_forward(model, x, input_pos)
-        loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1))
-        losses.append(float(loss.item()))
-    model.train()
+    try:
+        for _ in range(int(eval_steps)):
+            x, y = val_stream.next_batch(batch_size=batch_size, seq_len=seq_len, device=device)
+            logits = g.model_forward(model, x, input_pos)
+            loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1))
+            losses.append(float(loss.item()))
+    finally:
+        for child, bits in output_quant_snapshot:
+            child.output_quant_bits = bits
+        model.train()
     return float(sum(losses) / max(1, len(losses)))
 
 
@@ -669,13 +765,53 @@ def parse_args() -> argparse.Namespace:
         "--student_adc_bits",
         type=int,
         default=0,
-        help="ADC-style interface quantization bits applied to the student model's analog linear outputs during training. 0 disables.",
+        help="Draft-side ADC-style interface quantization bits applied to the trainable student model's analog linear outputs during training. 0 disables.",
     )
     parser.add_argument(
         "--teacher_adc_bits",
         type=int,
         default=0,
-        help="ADC-style interface quantization bits applied to the frozen teacher model during distillation. 0 disables.",
+        help="Optional ADC-style interface quantization bits applied to the frozen distillation teacher. Leave at 0 to keep the teacher truly clean.",
+    )
+    parser.add_argument(
+        "--student_adc_stochastic_rounding",
+        action="store_true",
+        help="If set, use stochastic rounding for the student draft-side ADC fake-quant path during training only.",
+    )
+    parser.add_argument(
+        "--student_adc_threshold_jitter",
+        type=float,
+        default=0.0,
+        help="Optional pre-round threshold jitter for the student draft-side ADC fake-quant path, measured in quantization-step units. Training only.",
+    )
+    parser.add_argument(
+        "--student_adc_learnable_clip",
+        action="store_true",
+        help="If set, learn one shared clip multiplier for the student draft-side ADC quantizer across the whole model.",
+    )
+    parser.add_argument(
+        "--student_adc_init_clip_scale",
+        type=float,
+        default=1.0,
+        help="Initial shared clip multiplier for the student draft-side ADC quantizer when --student_adc_learnable_clip is enabled.",
+    )
+    parser.add_argument(
+        "--student_adc_psum_splits",
+        type=int,
+        default=1,
+        help="If > 1, approximate accumulation-aware partial-sum quantization by splitting each linear accumulation into this many chunks during student training only.",
+    )
+    parser.add_argument(
+        "--weight_compactness_weight",
+        type=float,
+        default=0.0,
+        help="Weight on a uniform tail-compactness regularizer over trainable weight tensors.",
+    )
+    parser.add_argument(
+        "--weight_compactness_rms_mult",
+        type=float,
+        default=3.0,
+        help="Tail threshold for compactness regularization, measured in per-tensor RMS multiples.",
     )
 
     parser.add_argument("--prob_clean", type=float, default=0.25, help="Sampling probability weight for clean mode.")
@@ -766,6 +902,18 @@ def main() -> None:
         raise ValueError("--teacher_generated_top_k must be >= 1")
     if int(args.student_adc_bits) < 0 or int(args.teacher_adc_bits) < 0:
         raise ValueError("--student_adc_bits and --teacher_adc_bits must be >= 0")
+    if float(args.student_adc_threshold_jitter) < 0:
+        raise ValueError("--student_adc_threshold_jitter must be >= 0")
+    if float(args.student_adc_init_clip_scale) <= 0:
+        raise ValueError("--student_adc_init_clip_scale must be > 0")
+    if bool(args.student_adc_learnable_clip) and int(args.student_adc_bits) <= 0:
+        raise ValueError("--student_adc_learnable_clip requires --student_adc_bits > 0")
+    if int(args.student_adc_psum_splits) < 1:
+        raise ValueError("--student_adc_psum_splits must be >= 1")
+    if float(args.weight_compactness_weight) < 0:
+        raise ValueError("--weight_compactness_weight must be >= 0")
+    if float(args.weight_compactness_rms_mult) <= 0:
+        raise ValueError("--weight_compactness_rms_mult must be > 0")
     if int(args.train_last_n_layers) < 0:
         raise ValueError("--train_last_n_layers must be >= 0")
     if float(args.asam_rho) > 0 and int(args.grad_accum_steps) != 1:
@@ -795,8 +943,30 @@ def main() -> None:
 
     print(f"Loading model from {args.checkpoint_path} on {args.device}")
     model = g._load_model(args.checkpoint_path, args.device, precision, use_tp=False)
+    student_adc_log_clip: Optional[torch.nn.Parameter] = None
     if int(args.student_adc_bits) > 0:
         set_post_matmul_output_quant_bits(model, int(args.student_adc_bits))
+        set_post_matmul_output_quant_stochastic_mode(
+            model,
+            stochastic_rounding=bool(args.student_adc_stochastic_rounding),
+            threshold_jitter=float(args.student_adc_threshold_jitter),
+            training_only=True,
+        )
+        if bool(args.student_adc_learnable_clip):
+            init_clip = float(args.student_adc_init_clip_scale)
+            student_adc_log_clip = torch.nn.Parameter(
+                torch.tensor(math.log(init_clip), device=args.device, dtype=torch.float32)
+            )
+            set_post_matmul_output_quant_clip_scale(
+                model,
+                lambda p=student_adc_log_clip: p.exp(),
+            )
+        if int(args.student_adc_psum_splits) > 1:
+            set_post_matmul_output_quant_psum_mode(
+                model,
+                psum_splits=int(args.student_adc_psum_splits),
+                training_only=True,
+            )
     model.train()
     with torch.device(args.device):
         model.setup_caches(max_batch_size=int(args.batch_size), max_seq_length=int(args.seq_len))
@@ -847,7 +1017,26 @@ def main() -> None:
     )
     print(f"Noise mix probs: {dict(zip(mode_dist.names, mode_dist.probs))}")
     print(f"Write noise stds: {write_noise_stds}, read noise std: {read_noise_std}")
-    print(f"ADC bits: student={int(args.student_adc_bits)}, teacher={int(args.teacher_adc_bits)}")
+    print(
+        "ADC bits: "
+        f"student/draft={int(args.student_adc_bits)}, "
+        f"teacher={int(args.teacher_adc_bits)}"
+    )
+    print(
+        "Student ADC training noise: "
+        f"stochastic_rounding={bool(args.student_adc_stochastic_rounding)}, "
+        f"threshold_jitter={float(args.student_adc_threshold_jitter)}"
+    )
+    if student_adc_log_clip is not None:
+        print(f"Student ADC learnable clip: enabled init={float(args.student_adc_init_clip_scale)}")
+    if int(args.student_adc_psum_splits) > 1:
+        print(f"Student ADC PSUM mode: psum_splits={int(args.student_adc_psum_splits)}")
+    if float(args.weight_compactness_weight) > 0:
+        print(
+            "Weight compactness regularization: "
+            f"weight={float(args.weight_compactness_weight)}, "
+            f"rms_mult={float(args.weight_compactness_rms_mult)}"
+        )
 
     train_stream = ParquetTokenStream(
         parquet_paths=args.train_parquet,
@@ -868,27 +1057,42 @@ def main() -> None:
     trainable_params = [p for _, p in trainable_named_params]
     if len(trainable_params) == 0:
         raise ValueError("No trainable parameters selected. Adjust --train_buckets / --train_last_n_layers.")
+    extra_optimizer_params: List[torch.nn.Parameter] = []
+    optimizer_param_groups: List[dict] = [
+        {
+            "params": trainable_params,
+            "weight_decay": float(args.weight_decay),
+        }
+    ]
+    if student_adc_log_clip is not None:
+        extra_optimizer_params.append(student_adc_log_clip)
+        optimizer_param_groups.append(
+            {
+                "params": [student_adc_log_clip],
+                "weight_decay": 0.0,
+            }
+        )
 
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
-            trainable_params,
+            optimizer_param_groups,
             lr=float(args.lr),
             betas=(0.9, 0.95),
             eps=1e-8,
-            weight_decay=float(args.weight_decay),
         )
     else:
         optimizer = torch.optim.SGD(
-            trainable_params,
+            optimizer_param_groups,
             lr=float(args.lr),
             momentum=float(args.sgd_momentum),
-            weight_decay=float(args.weight_decay),
             nesterov=False,
         )
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
     mode_counts = {"clean": 0, "write": 0, "read": 0, "both": 0}
     teacher_generated_batches = 0
+    last_clean_val_loss: Optional[float] = None
+    last_clean_val_ppl: Optional[float] = None
     tokens_per_step = int(args.batch_size) * int(args.seq_len) * int(args.grad_accum_steps)
     train_start = time.perf_counter()
 
@@ -909,6 +1113,7 @@ def main() -> None:
         accum_main_loss = 0.0
         accum_cons_loss = 0.0
         accum_distill_loss = 0.0
+        accum_compactness_loss = 0.0
         bad_step = False
         bad_reason = ""
 
@@ -994,6 +1199,12 @@ def main() -> None:
                         acceptance_keep_ratio=float(args.acceptance_keep_ratio),
                         acceptance_tau=float(args.acceptance_tau),
                     )
+                    total_loss, compactness_loss_val = _apply_regularizers_(
+                        total_loss=total_loss,
+                        trainable_named_params=trainable_named_params,
+                        weight_compactness_weight=float(args.weight_compactness_weight),
+                        weight_compactness_rms_mult=float(args.weight_compactness_rms_mult),
+                    )
                 except ValueError as exc:
                     bad_step = True
                     bad_reason = str(exc)
@@ -1001,7 +1212,10 @@ def main() -> None:
 
                 if float(args.asam_rho) > 0:
                     total_loss.backward()
-                    grad_norm, grads_finite = _grad_norm_and_finite(model)
+                    grad_norm, grads_finite = _grad_norm_and_finite_with_extra(
+                        model,
+                        extra_params=extra_optimizer_params,
+                    )
                     if (not grads_finite) or (not math.isfinite(grad_norm)):
                         bad_step = True
                         bad_reason = "nonfinite_grad"
@@ -1033,6 +1247,12 @@ def main() -> None:
                             acceptance_keep_ratio=float(args.acceptance_keep_ratio),
                             acceptance_tau=float(args.acceptance_tau),
                         )
+                        total_loss, compactness_loss_val = _apply_regularizers_(
+                            total_loss=total_loss,
+                            trainable_named_params=trainable_named_params,
+                            weight_compactness_weight=float(args.weight_compactness_weight),
+                            weight_compactness_rms_mult=float(args.weight_compactness_rms_mult),
+                        )
                     except ValueError as exc:
                         bad_step = True
                         bad_reason = f"{exc}_asam"
@@ -1042,7 +1262,10 @@ def main() -> None:
                     _asam_restore_(trainable_named_params, eps_by_name)
                 elif float(args.awp_lr) > 0 and float(args.awp_eps) > 0:
                     total_loss.backward()
-                    grad_norm, grads_finite = _grad_norm_and_finite(model)
+                    grad_norm, grads_finite = _grad_norm_and_finite_with_extra(
+                        model,
+                        extra_params=extra_optimizer_params,
+                    )
                     if (not grads_finite) or (not math.isfinite(grad_norm)):
                         bad_step = True
                         bad_reason = "nonfinite_grad"
@@ -1075,6 +1298,12 @@ def main() -> None:
                             acceptance_keep_ratio=float(args.acceptance_keep_ratio),
                             acceptance_tau=float(args.acceptance_tau),
                         )
+                        total_loss, compactness_loss_val = _apply_regularizers_(
+                            total_loss=total_loss,
+                            trainable_named_params=trainable_named_params,
+                            weight_compactness_weight=float(args.weight_compactness_weight),
+                            weight_compactness_rms_mult=float(args.weight_compactness_rms_mult),
+                        )
                     except ValueError as exc:
                         bad_step = True
                         bad_reason = f"{exc}_awp"
@@ -1087,12 +1316,16 @@ def main() -> None:
                 accum_main_loss += float(main_loss.item())
                 accum_cons_loss += cons_loss_val
                 accum_distill_loss += distill_loss_val
+                accum_compactness_loss += compactness_loss_val
                 accum_loss += float(total_loss.item())
             finally:
                 if use_write:
                     _apply_write_noise_(param_groups=noise_params, stds=write_noise_stds, seed=noise_seed, add=False)
 
-            grad_norm, grads_finite = _grad_norm_and_finite(model)
+            grad_norm, grads_finite = _grad_norm_and_finite_with_extra(
+                model,
+                extra_params=extra_optimizer_params,
+            )
             if (not grads_finite) or (not math.isfinite(grad_norm)):
                 bad_step = True
                 bad_reason = "nonfinite_grad"
@@ -1110,7 +1343,10 @@ def main() -> None:
         _set_optimizer_lr(optimizer, lr_now)
 
         if float(args.max_grad_norm) > 0:
-            grad_norm, grads_finite = _grad_norm_and_finite(model)
+            grad_norm, grads_finite = _grad_norm_and_finite_with_extra(
+                model,
+                extra_params=extra_optimizer_params,
+            )
             if (not grads_finite) or (not math.isfinite(grad_norm)):
                 skipped_nonfinite_steps += 1
                 optimizer.zero_grad(set_to_none=True)
@@ -1119,7 +1355,11 @@ def main() -> None:
                 continue
             max_grad_norm = float(args.max_grad_norm)
             if grad_norm > max_grad_norm:
-                _scale_grads_(model, max_grad_norm / (grad_norm + 1e-6))
+                _scale_grads_with_extra_(
+                    model,
+                    max_grad_norm / (grad_norm + 1e-6),
+                    extra_params=extra_optimizer_params,
+                )
         else:
             grad_norm = 0.0
         optimizer.step()
@@ -1129,13 +1369,16 @@ def main() -> None:
         train_main_loss = accum_main_loss / float(args.grad_accum_steps)
         train_cons_loss = accum_cons_loss / float(args.grad_accum_steps)
         train_distill_loss = accum_distill_loss / float(args.grad_accum_steps)
+        train_compactness_loss = accum_compactness_loss / float(args.grad_accum_steps)
+        current_student_adc_clip_scale = None if student_adc_log_clip is None else float(student_adc_log_clip.detach().exp().item())
 
         if int(args.log_interval) > 0 and (step % int(args.log_interval) == 0):
             tok_s = float(tokens_per_step) / max(step_time, 1e-9)
             print(
                 f"step={step:04d} attempt={attempt:04d} "
-                f"loss={train_loss:.4f} main={train_main_loss:.4f} cons={train_cons_loss:.4f} distill={train_distill_loss:.4f} lr={lr_now:.3e} "
+                f"loss={train_loss:.4f} main={train_main_loss:.4f} cons={train_cons_loss:.4f} distill={train_distill_loss:.4f} compact={train_compactness_loss:.4f} lr={lr_now:.3e} "
                 f"grad_norm={grad_norm:.3f} tok/s={tok_s:.1f}"
+                + ("" if current_student_adc_clip_scale is None else f" adc_clip={current_student_adc_clip_scale:.4f}")
             )
 
         if int(args.eval_interval) > 0 and (step % int(args.eval_interval) == 0):
@@ -1147,7 +1390,9 @@ def main() -> None:
                 seq_len=int(args.seq_len),
                 eval_steps=int(args.eval_steps),
             )
-            print(f"[eval] step={step:04d} clean_val_loss={val_loss:.4f} ppl={torch.exp(torch.tensor(val_loss)).item():.2f}")
+            last_clean_val_loss = float(val_loss)
+            last_clean_val_ppl = float(torch.exp(torch.tensor(val_loss)).item())
+            print(f"[eval] step={step:04d} clean_val_loss={val_loss:.4f} ppl={last_clean_val_ppl:.2f}")
 
         if int(args.save_interval) > 0 and (step % int(args.save_interval) == 0):
             ckpt_path = args.save_dir / f"model_step_{step:04d}.pth"
@@ -1165,6 +1410,25 @@ def main() -> None:
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), args.output_path)
     set_read_noise_std(0.0)
+    final_clean_val_loss: Optional[float] = None
+    final_clean_val_ppl: Optional[float] = None
+    if int(args.eval_steps) > 0:
+        final_clean_val_loss = float(
+            _evaluate_clean_loss(
+                model=model,
+                val_stream=val_stream,
+                device=args.device,
+                batch_size=int(args.batch_size),
+                seq_len=int(args.seq_len),
+                eval_steps=int(args.eval_steps),
+            )
+        )
+        final_clean_val_ppl = float(torch.exp(torch.tensor(final_clean_val_loss)).item())
+        print(
+            "[final_eval] "
+            f"clean_val_loss={final_clean_val_loss:.4f} "
+            f"ppl={final_clean_val_ppl:.2f}"
+        )
 
     summary = {
         "checkpoint_path": str(args.checkpoint_path),
@@ -1197,7 +1461,17 @@ def main() -> None:
         "write_noise_stds": write_noise_stds,
         "read_noise_std": float(read_noise_std),
         "student_adc_bits": int(args.student_adc_bits),
+        "draft_adc_bits": int(args.student_adc_bits),
         "teacher_adc_bits": int(args.teacher_adc_bits),
+        "teacher_is_clean": bool(int(args.teacher_adc_bits) == 0),
+        "student_adc_stochastic_rounding": bool(args.student_adc_stochastic_rounding),
+        "student_adc_threshold_jitter": float(args.student_adc_threshold_jitter),
+        "student_adc_learnable_clip": bool(args.student_adc_learnable_clip),
+        "student_adc_init_clip_scale": float(args.student_adc_init_clip_scale),
+        "student_adc_final_clip_scale": None if student_adc_log_clip is None else float(student_adc_log_clip.detach().exp().item()),
+        "student_adc_psum_splits": int(args.student_adc_psum_splits),
+        "weight_compactness_weight": float(args.weight_compactness_weight),
+        "weight_compactness_rms_mult": float(args.weight_compactness_rms_mult),
         "mode_probs": dict(zip(mode_dist.names, mode_dist.probs)),
         "train_buckets": None if args.train_buckets is None else [str(x) for x in args.train_buckets],
         "train_last_n_layers": int(args.train_last_n_layers),
@@ -1205,6 +1479,10 @@ def main() -> None:
         "teacher_generated_ratio": float(args.teacher_generated_ratio),
         "teacher_generated_prompt_len": int(args.teacher_generated_prompt_len),
         "teacher_generated_top_k": int(args.teacher_generated_top_k),
+        "last_clean_val_loss": last_clean_val_loss,
+        "last_clean_val_ppl": last_clean_val_ppl,
+        "final_clean_val_loss": final_clean_val_loss,
+        "final_clean_val_ppl": final_clean_val_ppl,
     }
     summary_path = args.save_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")

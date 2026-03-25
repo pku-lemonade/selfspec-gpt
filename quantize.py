@@ -460,11 +460,53 @@ class FpOutputQuantLinear(torch.nn.Module):
         else:
             self.bias = linear.bias
         self.output_quant_bits = 0
+        self.output_quant_stochastic_rounding = False
+        self.output_quant_threshold_jitter = 0.0
+        self.output_quant_training_only = True
+        self.output_quant_clip_scale = None
+        self.output_quant_psum_splits = 1
+        self.output_quant_psum_training_only = True
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        out = F.linear(input, self.weight, self.bias)
         if self.output_quant_bits:
-            out = fake_quantize_per_token_symmetric(out, bits=int(self.output_quant_bits))
+            apply_stochastic = bool(self.output_quant_stochastic_rounding)
+            apply_jitter = float(self.output_quant_threshold_jitter)
+            if bool(self.output_quant_training_only) and (not self.training):
+                apply_stochastic = False
+                apply_jitter = 0.0
+            clip_scale = self.output_quant_clip_scale
+            if callable(clip_scale):
+                clip_scale = clip_scale()
+            use_psum = int(self.output_quant_psum_splits) > 1
+            if bool(self.output_quant_psum_training_only) and (not self.training):
+                use_psum = False
+            if use_psum:
+                x_chunks = torch.tensor_split(input, int(self.output_quant_psum_splits), dim=-1)
+                w_chunks = torch.tensor_split(self.weight, int(self.output_quant_psum_splits), dim=1)
+                out = None
+                for x_chunk, w_chunk in zip(x_chunks, w_chunks):
+                    partial = F.linear(x_chunk, w_chunk, None)
+                    partial = fake_quantize_per_token_symmetric(
+                        partial,
+                        bits=int(self.output_quant_bits),
+                        stochastic_rounding=apply_stochastic,
+                        threshold_jitter=apply_jitter,
+                        clip_scale=clip_scale,
+                    )
+                    out = partial if out is None else (out + partial)
+                if self.bias is not None:
+                    out = out + self.bias
+            else:
+                out = F.linear(input, self.weight, self.bias)
+                out = fake_quantize_per_token_symmetric(
+                    out,
+                    bits=int(self.output_quant_bits),
+                    stochastic_rounding=apply_stochastic,
+                    threshold_jitter=apply_jitter,
+                    clip_scale=clip_scale,
+                )
+        else:
+            out = F.linear(input, self.weight, self.bias)
         return out
 
 
@@ -484,13 +526,23 @@ def replace_linear_fake_act_quant(module):
             replace_linear_fake_act_quant(child)
 
 
-def fake_quantize_per_token_symmetric(x: torch.Tensor, *, bits: int, eps: float = 1e-8) -> torch.Tensor:
+def fake_quantize_per_token_symmetric(
+    x: torch.Tensor,
+    *,
+    bits: int,
+    stochastic_rounding: bool = False,
+    threshold_jitter: float = 0.0,
+    clip_scale = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
     if bits <= 0:
         return x
     if not x.is_floating_point():
         return x
     if bits < 2 or bits > 16:
         raise ValueError("bits must be an integer in [2, 16]")
+    if float(threshold_jitter) < 0:
+        raise ValueError("threshold_jitter must be >= 0")
 
     qmin = -(1 << (bits - 1))
     qmax = (1 << (bits - 1)) - 1
@@ -500,9 +552,25 @@ def fake_quantize_per_token_symmetric(x: torch.Tensor, *, bits: int, eps: float 
         return x
     x2 = x.reshape(-1, origin[-1]).float()
     absmax = x2.abs().amax(dim=1, keepdim=True)
-    scale = absmax / float(qmax)
+    clip_bound = absmax
+    if clip_scale is not None:
+        if isinstance(clip_scale, torch.Tensor):
+            clip_scale_t = clip_scale.to(device=x2.device, dtype=x2.dtype)
+        else:
+            clip_scale_t = torch.tensor(float(clip_scale), device=x2.device, dtype=x2.dtype)
+        clip_bound = torch.clamp(absmax * clip_scale_t, min=eps)
+        x2 = x2.clamp(min=-clip_bound, max=clip_bound)
+    scale = clip_bound / float(qmax)
     scale = torch.clamp(scale, min=eps)
-    q = torch.clamp((x2 / scale).round(), qmin, qmax)
+    x_scaled = x2 / scale
+    if float(threshold_jitter) > 0:
+        x_scaled = x_scaled + (torch.rand_like(x_scaled) * 2.0 - 1.0) * float(threshold_jitter)
+    if stochastic_rounding:
+        q_floor = torch.floor(x_scaled)
+        q = q_floor + torch.bernoulli((x_scaled - q_floor).clamp_(0.0, 1.0))
+    else:
+        q = torch.round(x_scaled)
+    q = torch.clamp(q, qmin, qmax)
     y = (q * scale).reshape(origin)
     return y.to(dtype=x.dtype)
 
@@ -518,6 +586,45 @@ def set_post_matmul_output_quant_bits(module: torch.nn.Module, bits: int) -> Non
     for child in module.modules():
         if hasattr(child, "output_quant_bits"):
             child.output_quant_bits = bits
+
+
+def set_post_matmul_output_quant_stochastic_mode(
+    module: torch.nn.Module,
+    *,
+    stochastic_rounding: bool = False,
+    threshold_jitter: float = 0.0,
+    training_only: bool = True,
+) -> None:
+    if float(threshold_jitter) < 0:
+        raise ValueError("post-matmul threshold jitter must be >= 0")
+
+    for child in module.modules():
+        if hasattr(child, "output_quant_bits"):
+            child.output_quant_stochastic_rounding = bool(stochastic_rounding)
+            child.output_quant_threshold_jitter = float(threshold_jitter)
+            child.output_quant_training_only = bool(training_only)
+
+
+def set_post_matmul_output_quant_clip_scale(module: torch.nn.Module, clip_scale) -> None:
+    for child in module.modules():
+        if hasattr(child, "output_quant_bits"):
+            child.output_quant_clip_scale = clip_scale
+
+
+def set_post_matmul_output_quant_psum_mode(
+    module: torch.nn.Module,
+    *,
+    psum_splits: int = 1,
+    training_only: bool = True,
+) -> None:
+    psum_splits = int(psum_splits)
+    if psum_splits < 1:
+        raise ValueError("post-matmul psum_splits must be >= 1")
+
+    for child in module.modules():
+        if hasattr(child, "output_quant_bits"):
+            child.output_quant_psum_splits = psum_splits
+            child.output_quant_psum_training_only = bool(training_only)
 
 ##### weight only int4 per channel groupwise quantized code ######
 

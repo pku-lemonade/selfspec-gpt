@@ -269,6 +269,18 @@ def main() -> None:
         help="ADC-style interface quantization bits for the draft analog linear outputs. 0 disables.",
     )
     parser.add_argument(
+        "--verify_adc_clip_scale",
+        type=float,
+        default=None,
+        help="Optional shared clip multiplier applied to verify-side ADC fake quantization.",
+    )
+    parser.add_argument(
+        "--draft_adc_clip_scale",
+        type=float,
+        default=None,
+        help="Optional shared clip multiplier applied to draft-side ADC fake quantization.",
+    )
+    parser.add_argument(
         "--post_matmul_quant_bits",
         type=int,
         default=0,
@@ -335,9 +347,11 @@ def main() -> None:
 
     model = g._load_model(args.checkpoint_path, args.device, precision, use_tp=False, int8_act_quant=bool(args.int8_act_quant))
     if verify_quant_bits:
-        from quantize import set_post_matmul_output_quant_bits
+        from quantize import set_post_matmul_output_quant_bits, set_post_matmul_output_quant_clip_scale
 
         set_post_matmul_output_quant_bits(model, int(verify_quant_bits))
+        if args.verify_adc_clip_scale is not None:
+            set_post_matmul_output_quant_clip_scale(model, float(args.verify_adc_clip_scale))
 
     if args.draft_dequantize_int8:
         draft_model = g._load_int8_weight_only_as_fp_model(args.draft_checkpoint_path, draft_device, precision, use_tp=False)
@@ -349,9 +363,11 @@ def main() -> None:
 
         replace_linear_fake_act_quant(draft_model)
     if draft_quant_bits:
-        from quantize import set_post_matmul_output_quant_bits
+        from quantize import set_post_matmul_output_quant_bits, set_post_matmul_output_quant_clip_scale
 
         set_post_matmul_output_quant_bits(draft_model, int(draft_quant_bits))
+        if args.draft_adc_clip_scale is not None:
+            set_post_matmul_output_quant_clip_scale(draft_model, float(args.draft_adc_clip_scale))
 
     # Optional draft noise after load.
     n_layer = len(draft_model.layers)
@@ -438,6 +454,8 @@ def main() -> None:
                 "int8_act_quant": bool(args.int8_act_quant),
                 "verify_adc_bits": int(verify_quant_bits),
                 "draft_adc_bits": int(draft_quant_bits),
+                "verify_adc_clip_scale": None if args.verify_adc_clip_scale is None else float(args.verify_adc_clip_scale),
+                "draft_adc_clip_scale": None if args.draft_adc_clip_scale is None else float(args.draft_adc_clip_scale),
                 "post_matmul_quant_bits": int(args.post_matmul_quant_bits),
                 "draft_post_matmul_quant_bits": int(args.draft_post_matmul_quant_bits),
                 "device": str(args.device),
@@ -523,6 +541,8 @@ def main() -> None:
                 "int8_act_quant": bool(args.int8_act_quant),
                 "verify_adc_bits": int(verify_quant_bits),
                 "draft_adc_bits": int(draft_quant_bits),
+                "verify_adc_clip_scale": None if args.verify_adc_clip_scale is None else float(args.verify_adc_clip_scale),
+                "draft_adc_clip_scale": None if args.draft_adc_clip_scale is None else float(args.draft_adc_clip_scale),
                 "post_matmul_quant_bits": int(args.post_matmul_quant_bits),
                 "draft_post_matmul_quant_bits": int(args.draft_post_matmul_quant_bits),
                 "device": str(args.device),

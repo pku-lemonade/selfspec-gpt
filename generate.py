@@ -535,6 +535,8 @@ def main(
     int8_act_quant: bool = False,
     verify_adc_bits: int = 0,
     draft_adc_bits: int = 0,
+    verify_adc_clip_scale: Optional[float] = None,
+    draft_adc_clip_scale: Optional[float] = None,
     post_matmul_quant_bits: int = 0,
     draft_post_matmul_quant_bits: int = 0,
     speculate_k: int = 5,
@@ -599,9 +601,11 @@ def main(
     )
 
     if verify_quant_bits:
-        from quantize import set_post_matmul_output_quant_bits
+        from quantize import set_post_matmul_output_quant_bits, set_post_matmul_output_quant_clip_scale
 
         set_post_matmul_output_quant_bits(model, verify_quant_bits)
+        if verify_adc_clip_scale is not None:
+            set_post_matmul_output_quant_clip_scale(model, float(verify_adc_clip_scale))
 
     if is_speculative:
         if draft_dequantize_int8:
@@ -658,9 +662,11 @@ def main(
             print(f"Noised params (numel): ffn={counts['ffn']}, qkv={counts['qkv']}, out={counts['out']}")
 
         if draft_quant_bits:
-            from quantize import set_post_matmul_output_quant_bits
+            from quantize import set_post_matmul_output_quant_bits, set_post_matmul_output_quant_clip_scale
 
             set_post_matmul_output_quant_bits(draft_model, draft_quant_bits)
+            if draft_adc_clip_scale is not None:
+                set_post_matmul_output_quant_clip_scale(draft_model, float(draft_adc_clip_scale))
     else:
         draft_model = None
 
@@ -836,6 +842,8 @@ def main(
                     "int8_act_quant": bool(int8_act_quant),
                     "verify_adc_bits": int(verify_quant_bits),
                     "draft_adc_bits": int(draft_quant_bits),
+                    "verify_adc_clip_scale": None if verify_adc_clip_scale is None else float(verify_adc_clip_scale),
+                    "draft_adc_clip_scale": None if draft_adc_clip_scale is None else float(draft_adc_clip_scale),
                     "post_matmul_quant_bits": int(post_matmul_quant_bits),
                     "draft_post_matmul_quant_bits": int(draft_post_matmul_quant_bits),
                     "compile": bool(compile),
@@ -929,6 +937,18 @@ if __name__ == '__main__':
         help='ADC-style interface quantization bits for the draft analog linear outputs. 0 disables.',
     )
     parser.add_argument(
+        '--verify_adc_clip_scale',
+        type=float,
+        default=None,
+        help='Optional shared clip multiplier applied to verify ADC/interface quantization.',
+    )
+    parser.add_argument(
+        '--draft_adc_clip_scale',
+        type=float,
+        default=None,
+        help='Optional shared clip multiplier applied to draft ADC/interface quantization.',
+    )
+    parser.add_argument(
         '--post_matmul_quant_bits',
         type=int,
         default=0,
@@ -1003,6 +1023,8 @@ if __name__ == '__main__':
         args.int8_act_quant,
         args.verify_adc_bits,
         args.draft_adc_bits,
+        args.verify_adc_clip_scale,
+        args.draft_adc_clip_scale,
         args.post_matmul_quant_bits,
         args.draft_post_matmul_quant_bits,
         args.speculate_k,
