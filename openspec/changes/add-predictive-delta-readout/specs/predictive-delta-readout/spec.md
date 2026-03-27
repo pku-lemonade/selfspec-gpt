@@ -28,6 +28,18 @@ When verify delta readout is enabled and a previous reconstructed output exists,
 - **AND** the simulator reconstructs the current output as `prev_reconstructed + quantized_delta`
 - **AND** the simulator stores that reconstructed current output as the baseline for the next token
 
+### Requirement: Optionally quantize the delta-readout DAC feedback baseline
+When verify delta readout is enabled, the simulator SHALL allow the stored previous reconstructed output to be quantized before the subtraction step to model finite DAC feedback precision.
+
+#### Scenario: DAC feedback precision is configured
+- **WHEN** verify delta readout is enabled and `verify_delta_dac_bits > 0`
+- **THEN** the simulator quantizes the stored previous reconstructed output before forming the analog-domain delta signal
+- **AND** the simulator still reconstructs the current output by adding the ADC-quantized delta to the stored previous reconstructed output
+
+#### Scenario: DAC feedback precision is left ideal
+- **WHEN** verify delta readout is enabled and `verify_delta_dac_bits = 0`
+- **THEN** the simulator preserves the previous ideal-feedback delta-readout behavior
+
 ### Requirement: Preserve token-order continuity within one sequence
 Within one prompt/generation stream, predictive delta readout SHALL follow token order rather than resetting between internal forward calls.
 

@@ -241,6 +241,13 @@ def generate(
     if is_speculative:
         assert batch_size == 1, "Speculative decoding currently supports batch_size=1"
         draft_device = draft_model.output.weight.device
+
+    from quantize import reset_post_matmul_output_quant_state
+
+    reset_post_matmul_output_quant_state(model)
+    if is_speculative and draft_model is not model:
+        reset_post_matmul_output_quant_state(draft_model)
+
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
     T_new = T + max_new_tokens
@@ -435,6 +442,17 @@ def _resolve_interface_quant_bits(
     return bits
 
 
+def _resolve_optional_quant_bits(
+    *,
+    bits: int,
+    label: str,
+) -> int:
+    bits = int(bits)
+    if bits != 0 and (bits < 2 or bits > 16):
+        raise ValueError(f"{label} bits must be 0 or an integer in [2, 16]")
+    return bits
+
+
 @torch.no_grad()
 def add_gaussian_noise_to_draft_weights_(
     model: Transformer,
@@ -534,7 +552,11 @@ def main(
     draft_fake_act_quant_int8: bool = False,
     int8_act_quant: bool = False,
     verify_adc_bits: int = 0,
+    verify_delta_readout: bool = False,
+    verify_delta_dac_bits: int = 0,
     draft_adc_bits: int = 0,
+    draft_delta_readout: bool = False,
+    draft_delta_dac_bits: int = 0,
     verify_adc_clip_scale: Optional[float] = None,
     draft_adc_clip_scale: Optional[float] = None,
     post_matmul_quant_bits: int = 0,
@@ -594,18 +616,42 @@ def main(
         legacy_bits=post_matmul_quant_bits,
         label="verify ADC/interface",
     )
+    verify_delta_dac_quant_bits = _resolve_optional_quant_bits(
+        bits=verify_delta_dac_bits,
+        label="verify delta-readout DAC",
+    )
     draft_quant_bits = _resolve_interface_quant_bits(
         explicit_bits=draft_adc_bits,
         legacy_bits=draft_post_matmul_quant_bits,
         label="draft ADC/interface",
     )
+    draft_delta_dac_quant_bits = _resolve_optional_quant_bits(
+        bits=draft_delta_dac_bits,
+        label="draft delta-readout DAC",
+    )
+
+    if verify_delta_dac_quant_bits and (not verify_delta_readout):
+        raise ValueError("--verify_delta_dac_bits requires --verify_delta_readout.")
+    if draft_delta_dac_quant_bits and (not draft_delta_readout):
+        raise ValueError("--draft_delta_dac_bits requires --draft_delta_readout.")
+    if draft_delta_readout and (not draft_quant_bits):
+        raise ValueError("--draft_delta_readout requires --draft_adc_bits > 0 (or legacy --draft_post_matmul_quant_bits).")
 
     if verify_quant_bits:
-        from quantize import set_post_matmul_output_quant_bits, set_post_matmul_output_quant_clip_scale
+        from quantize import (
+            set_post_matmul_output_quant_bits,
+            set_post_matmul_output_quant_clip_scale,
+            set_post_matmul_output_quant_delta_dac_bits,
+            set_post_matmul_output_quant_delta_mode,
+        )
 
         set_post_matmul_output_quant_bits(model, verify_quant_bits)
+        set_post_matmul_output_quant_delta_mode(model, delta_readout=bool(verify_delta_readout))
+        set_post_matmul_output_quant_delta_dac_bits(model, bits=int(verify_delta_dac_quant_bits))
         if verify_adc_clip_scale is not None:
             set_post_matmul_output_quant_clip_scale(model, float(verify_adc_clip_scale))
+    elif verify_delta_readout:
+        raise ValueError("--verify_delta_readout requires --verify_adc_bits > 0 (or legacy --post_matmul_quant_bits).")
 
     if is_speculative:
         if draft_dequantize_int8:
@@ -662,9 +708,16 @@ def main(
             print(f"Noised params (numel): ffn={counts['ffn']}, qkv={counts['qkv']}, out={counts['out']}")
 
         if draft_quant_bits:
-            from quantize import set_post_matmul_output_quant_bits, set_post_matmul_output_quant_clip_scale
+            from quantize import (
+                set_post_matmul_output_quant_bits,
+                set_post_matmul_output_quant_clip_scale,
+                set_post_matmul_output_quant_delta_dac_bits,
+                set_post_matmul_output_quant_delta_mode,
+            )
 
             set_post_matmul_output_quant_bits(draft_model, draft_quant_bits)
+            set_post_matmul_output_quant_delta_mode(draft_model, delta_readout=bool(draft_delta_readout))
+            set_post_matmul_output_quant_delta_dac_bits(draft_model, bits=int(draft_delta_dac_quant_bits))
             if draft_adc_clip_scale is not None:
                 set_post_matmul_output_quant_clip_scale(draft_model, float(draft_adc_clip_scale))
     else:
@@ -841,7 +894,13 @@ def main(
                     "draft_fake_act_quant_int8": bool(draft_fake_act_quant_int8),
                     "int8_act_quant": bool(int8_act_quant),
                     "verify_adc_bits": int(verify_quant_bits),
+                    "verify_delta_readout": bool(verify_delta_readout),
+                    "verify_delta_dac_bits": int(verify_delta_dac_quant_bits),
+                    "verify_adc_quant_domain": "delta" if bool(verify_delta_readout) else "absolute",
                     "draft_adc_bits": int(draft_quant_bits),
+                    "draft_delta_readout": bool(draft_delta_readout),
+                    "draft_delta_dac_bits": int(draft_delta_dac_quant_bits),
+                    "draft_adc_quant_domain": "delta" if bool(draft_delta_readout) else "absolute",
                     "verify_adc_clip_scale": None if verify_adc_clip_scale is None else float(verify_adc_clip_scale),
                     "draft_adc_clip_scale": None if draft_adc_clip_scale is None else float(draft_adc_clip_scale),
                     "post_matmul_quant_bits": int(post_matmul_quant_bits),
@@ -931,10 +990,32 @@ if __name__ == '__main__':
         help='ADC-style interface quantization bits for the verify/target analog linear outputs. 0 disables.',
     )
     parser.add_argument(
+        '--verify_delta_readout',
+        action='store_true',
+        help='If set, quantize verify ADC outputs in predictive-delta mode against the previous reconstructed token output.',
+    )
+    parser.add_argument(
+        '--verify_delta_dac_bits',
+        type=int,
+        default=0,
+        help='Optional DAC bitwidth for the stored verify delta-readout feedback baseline. 0 keeps DAC feedback ideal/unmodeled.',
+    )
+    parser.add_argument(
         '--draft_adc_bits',
         type=int,
         default=0,
         help='ADC-style interface quantization bits for the draft analog linear outputs. 0 disables.',
+    )
+    parser.add_argument(
+        '--draft_delta_readout',
+        action='store_true',
+        help='If set, quantize draft ADC outputs in predictive-delta mode against the previous reconstructed token output.',
+    )
+    parser.add_argument(
+        '--draft_delta_dac_bits',
+        type=int,
+        default=0,
+        help='Optional DAC bitwidth for the stored draft delta-readout feedback baseline. 0 keeps DAC feedback ideal/unmodeled.',
     )
     parser.add_argument(
         '--verify_adc_clip_scale',
@@ -1010,9 +1091,15 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
     args = parser.parse_args()
+    compile_enabled = bool(args.compile)
+    compile_prefill_enabled = bool(args.compile_prefill)
+    if (bool(args.verify_delta_readout) or bool(args.draft_delta_readout)) and compile_enabled:
+        print("WARNING: disabling torch.compile because delta-readout uses stateful quantization")
+        compile_enabled = False
+        compile_prefill_enabled = False
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, (args.compile and (not args.no_compile_block_mask)), args.profile, args.draft_checkpoint_path,
+        args.temperature, args.checkpoint_path, compile_enabled, compile_prefill_enabled, (compile_enabled and (not args.no_compile_block_mask)), args.profile, args.draft_checkpoint_path,
         args.draft_device,
         args.draft_noise_std,
         args.draft_noise_level_stds,
@@ -1022,7 +1109,11 @@ if __name__ == '__main__':
         args.draft_fake_act_quant_int8,
         args.int8_act_quant,
         args.verify_adc_bits,
+        args.verify_delta_readout,
+        args.verify_delta_dac_bits,
         args.draft_adc_bits,
+        args.draft_delta_readout,
+        args.draft_delta_dac_bits,
         args.verify_adc_clip_scale,
         args.draft_adc_clip_scale,
         args.post_matmul_quant_bits,

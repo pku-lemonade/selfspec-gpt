@@ -466,31 +466,153 @@ class FpOutputQuantLinear(torch.nn.Module):
         self.output_quant_clip_scale = None
         self.output_quant_psum_splits = 1
         self.output_quant_psum_training_only = True
+        self.output_quant_delta_readout = False
+        self.output_quant_delta_dac_bits = 0
+        self.output_quant_prev_reconstructed = None
+
+    def reset_output_quant_state(self) -> None:
+        self.output_quant_prev_reconstructed = None
+
+    def _current_quant_kwargs(self) -> tuple[bool, float, object]:
+        apply_stochastic = bool(self.output_quant_stochastic_rounding)
+        apply_jitter = float(self.output_quant_threshold_jitter)
+        if bool(self.output_quant_training_only) and (not self.training):
+            apply_stochastic = False
+            apply_jitter = 0.0
+        clip_scale = self.output_quant_clip_scale
+        if callable(clip_scale):
+            clip_scale = clip_scale()
+        return apply_stochastic, apply_jitter, clip_scale
+
+    def _fake_quantize_with_bits(
+        self,
+        x: torch.Tensor,
+        *,
+        bits: int,
+        apply_stochastic: bool,
+        apply_jitter: float,
+        clip_scale,
+    ) -> torch.Tensor:
+        return fake_quantize_per_token_symmetric(
+            x,
+            bits=int(bits),
+            stochastic_rounding=apply_stochastic,
+            threshold_jitter=apply_jitter,
+            clip_scale=clip_scale,
+        )
+
+    def _fake_quantize_output(
+        self,
+        x: torch.Tensor,
+        *,
+        apply_stochastic: bool,
+        apply_jitter: float,
+        clip_scale,
+    ) -> torch.Tensor:
+        return self._fake_quantize_with_bits(
+            x,
+            bits=int(self.output_quant_bits),
+            apply_stochastic=apply_stochastic,
+            apply_jitter=apply_jitter,
+            clip_scale=clip_scale,
+        )
+
+    def _apply_delta_readout_quant(
+        self,
+        out: torch.Tensor,
+        *,
+        apply_stochastic: bool,
+        apply_jitter: float,
+        clip_scale,
+    ) -> torch.Tensor:
+        if out.numel() == 0:
+            return out
+
+        original_shape = out.shape
+        if out.dim() == 1:
+            seq_view = out.view(1, 1, -1)
+            restore = lambda y: y.view(original_shape)
+        elif out.dim() == 2:
+            seq_view = out.unsqueeze(1)
+            restore = lambda y: y.squeeze(1)
+        elif out.dim() == 3:
+            seq_view = out
+            restore = lambda y: y
+        else:
+            batch = int(torch.tensor(original_shape[:-2]).prod().item())
+            seq_view = out.reshape(batch, original_shape[-2], original_shape[-1])
+            restore = lambda y: y.reshape(original_shape)
+
+        prev = self.output_quant_prev_reconstructed
+        expected_shape = (seq_view.size(0), seq_view.size(-1))
+        if (
+            prev is None
+            or tuple(prev.shape) != expected_shape
+            or prev.device != seq_view.device
+            or prev.dtype != seq_view.dtype
+        ):
+            prev = None
+
+        reconstructed_steps = []
+        for token_idx in range(seq_view.size(1)):
+            current = seq_view[:, token_idx, :]
+            if prev is None:
+                current_reconstructed = self._fake_quantize_output(
+                    current,
+                    apply_stochastic=apply_stochastic,
+                    apply_jitter=apply_jitter,
+                    clip_scale=clip_scale,
+                )
+            else:
+                prev_feedback = prev
+                if int(self.output_quant_delta_dac_bits) > 0:
+                    prev_feedback = self._fake_quantize_with_bits(
+                        prev,
+                        bits=int(self.output_quant_delta_dac_bits),
+                        apply_stochastic=False,
+                        apply_jitter=0.0,
+                        clip_scale=None,
+                    )
+                delta = current - prev_feedback
+                delta_reconstructed = self._fake_quantize_output(
+                    delta,
+                    apply_stochastic=apply_stochastic,
+                    apply_jitter=apply_jitter,
+                    clip_scale=clip_scale,
+                )
+                # The DAC-limited baseline affects the analog subtraction path, while
+                # the digital feedback register still adds back the stored previous output.
+                current_reconstructed = prev + delta_reconstructed
+            reconstructed_steps.append(current_reconstructed)
+            prev = current_reconstructed.detach()
+
+        self.output_quant_prev_reconstructed = prev
+        return restore(torch.stack(reconstructed_steps, dim=1))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.output_quant_bits:
-            apply_stochastic = bool(self.output_quant_stochastic_rounding)
-            apply_jitter = float(self.output_quant_threshold_jitter)
-            if bool(self.output_quant_training_only) and (not self.training):
-                apply_stochastic = False
-                apply_jitter = 0.0
-            clip_scale = self.output_quant_clip_scale
-            if callable(clip_scale):
-                clip_scale = clip_scale()
+            apply_stochastic, apply_jitter, clip_scale = self._current_quant_kwargs()
             use_psum = int(self.output_quant_psum_splits) > 1
             if bool(self.output_quant_psum_training_only) and (not self.training):
                 use_psum = False
-            if use_psum:
+            if bool(self.output_quant_delta_readout):
+                out = F.linear(input, self.weight, self.bias)
+                out = self._apply_delta_readout_quant(
+                    out,
+                    apply_stochastic=apply_stochastic,
+                    apply_jitter=apply_jitter,
+                    clip_scale=clip_scale,
+                )
+            elif use_psum:
                 x_chunks = torch.tensor_split(input, int(self.output_quant_psum_splits), dim=-1)
                 w_chunks = torch.tensor_split(self.weight, int(self.output_quant_psum_splits), dim=1)
                 out = None
                 for x_chunk, w_chunk in zip(x_chunks, w_chunks):
                     partial = F.linear(x_chunk, w_chunk, None)
-                    partial = fake_quantize_per_token_symmetric(
+                    partial = self._fake_quantize_output(
                         partial,
-                        bits=int(self.output_quant_bits),
-                        stochastic_rounding=apply_stochastic,
-                        threshold_jitter=apply_jitter,
+                        apply_stochastic=apply_stochastic,
+                        apply_jitter=apply_jitter,
                         clip_scale=clip_scale,
                     )
                     out = partial if out is None else (out + partial)
@@ -498,11 +620,10 @@ class FpOutputQuantLinear(torch.nn.Module):
                     out = out + self.bias
             else:
                 out = F.linear(input, self.weight, self.bias)
-                out = fake_quantize_per_token_symmetric(
+                out = self._fake_quantize_output(
                     out,
-                    bits=int(self.output_quant_bits),
-                    stochastic_rounding=apply_stochastic,
-                    threshold_jitter=apply_jitter,
+                    apply_stochastic=apply_stochastic,
+                    apply_jitter=apply_jitter,
                     clip_scale=clip_scale,
                 )
         else:
@@ -609,6 +730,40 @@ def set_post_matmul_output_quant_clip_scale(module: torch.nn.Module, clip_scale)
     for child in module.modules():
         if hasattr(child, "output_quant_bits"):
             child.output_quant_clip_scale = clip_scale
+
+
+def set_post_matmul_output_quant_delta_mode(
+    module: torch.nn.Module,
+    *,
+    delta_readout: bool = False,
+) -> None:
+    for child in module.modules():
+        if hasattr(child, "output_quant_bits"):
+            child.output_quant_delta_readout = bool(delta_readout)
+            if hasattr(child, "reset_output_quant_state"):
+                child.reset_output_quant_state()
+
+
+def set_post_matmul_output_quant_delta_dac_bits(
+    module: torch.nn.Module,
+    *,
+    bits: int = 0,
+) -> None:
+    bits = int(bits)
+    if bits != 0 and (bits < 2 or bits > 16):
+        raise ValueError("delta-readout DAC bits must be 0 or an integer in [2, 16]")
+
+    for child in module.modules():
+        if hasattr(child, "output_quant_bits"):
+            child.output_quant_delta_dac_bits = bits
+            if hasattr(child, "reset_output_quant_state"):
+                child.reset_output_quant_state()
+
+
+def reset_post_matmul_output_quant_state(module: torch.nn.Module) -> None:
+    for child in module.modules():
+        if hasattr(child, "reset_output_quant_state"):
+            child.reset_output_quant_state()
 
 
 def set_post_matmul_output_quant_psum_mode(

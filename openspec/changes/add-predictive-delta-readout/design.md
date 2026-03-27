@@ -9,11 +9,12 @@ That means the repository can currently study "how many bits does absolute verif
 **Goals:**
 - Add roadmap-aligned predictive delta readout to the functional simulator.
 - Scope the first implementation to the verify/target ADC path.
+- Allow the stored verify feedback baseline to use optional DAC-side quantization.
 - Make sequence-boundary behavior explicit so runs are reproducible and comparable.
 - Export the verify readout mode in metadata and sweep outputs.
 
 **Non-Goals:**
-- Model the physical DAC or hardware-estimator PPA changes in this change.
+- Model hardware-estimator PPA changes from the added DAC path in this change.
 - Extend delta readout to draft ADC or finetuning paths in this first pass.
 - Implement the roadmap's full draft/full-precision block policy or reuse-policy matrix in this change.
 
@@ -47,6 +48,21 @@ Rationale:
 - preserves replayability of existing experiments
 - makes the new behavior opt-in instead of silently changing verify ADC semantics
 
+### Decision: DAC feedback precision is modeled as optional quantization of the stored delta baseline
+
+When verify delta readout is enabled, the simulator may optionally quantize the stored previous reconstructed output before analog subtraction by using a knob such as `--verify_delta_dac_bits`.
+
+Rules:
+- `--verify_delta_dac_bits = 0` keeps the DAC feedback path ideal / unmodeled
+- `--verify_delta_dac_bits > 0` requires `--verify_delta_readout`
+- the DAC-limited baseline is used for the subtraction step, while digital reconstruction still adds back the stored previous reconstructed output
+- `--verify_adc_clip_scale` still applies only to the ADC-quantized delta signal, not to the DAC feedback baseline
+
+Rationale:
+- captures the roadmap's finite-DAC feedback concept without introducing a full analog circuit model
+- lets experiments separate "ADC delta precision" from "feedback DAC precision"
+- preserves the previous default behavior when the DAC knob is not used
+
 ### Decision: Reset delta-readout state only at explicit sequence boundaries
 
 The simulator will clear stored delta baselines:
@@ -69,6 +85,7 @@ Rationale:
 Metadata and sweep outputs should record:
 
 - the configured verify ADC precision
+- the configured verify delta-readout DAC precision
 - whether verify readout used absolute or predictive-delta mode
 
 Suggested resolved field:

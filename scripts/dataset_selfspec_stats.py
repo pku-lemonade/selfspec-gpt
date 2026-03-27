@@ -263,10 +263,32 @@ def main() -> None:
         help="ADC-style interface quantization bits for the target/verify analog linear outputs. 0 disables.",
     )
     parser.add_argument(
+        "--verify_delta_readout",
+        action="store_true",
+        help="If set, quantize verify ADC outputs in predictive-delta mode against the previous reconstructed token output.",
+    )
+    parser.add_argument(
+        "--verify_delta_dac_bits",
+        type=int,
+        default=0,
+        help="Optional DAC bitwidth for the stored verify delta-readout feedback baseline. 0 keeps DAC feedback ideal/unmodeled.",
+    )
+    parser.add_argument(
         "--draft_adc_bits",
         type=int,
         default=0,
         help="ADC-style interface quantization bits for the draft analog linear outputs. 0 disables.",
+    )
+    parser.add_argument(
+        "--draft_delta_readout",
+        action="store_true",
+        help="If set, quantize draft ADC outputs in predictive-delta mode against the previous reconstructed token output.",
+    )
+    parser.add_argument(
+        "--draft_delta_dac_bits",
+        type=int,
+        default=0,
+        help="Optional DAC bitwidth for the stored draft delta-readout feedback baseline. 0 keeps DAC feedback ideal/unmodeled.",
     )
     parser.add_argument(
         "--verify_adc_clip_scale",
@@ -339,19 +361,43 @@ def main() -> None:
         legacy_bits=int(args.post_matmul_quant_bits),
         label="verify ADC/interface",
     )
+    verify_delta_dac_quant_bits = g._resolve_optional_quant_bits(
+        bits=int(args.verify_delta_dac_bits),
+        label="verify delta-readout DAC",
+    )
     draft_quant_bits = g._resolve_interface_quant_bits(
         explicit_bits=int(args.draft_adc_bits),
         legacy_bits=int(args.draft_post_matmul_quant_bits),
         label="draft ADC/interface",
     )
+    draft_delta_dac_quant_bits = g._resolve_optional_quant_bits(
+        bits=int(args.draft_delta_dac_bits),
+        label="draft delta-readout DAC",
+    )
+
+    if verify_delta_dac_quant_bits and (not args.verify_delta_readout):
+        raise ValueError("--verify_delta_dac_bits requires --verify_delta_readout.")
+    if draft_delta_dac_quant_bits and (not args.draft_delta_readout):
+        raise ValueError("--draft_delta_dac_bits requires --draft_delta_readout.")
+    if args.draft_delta_readout and (not draft_quant_bits):
+        raise ValueError("--draft_delta_readout requires --draft_adc_bits > 0 (or legacy --draft_post_matmul_quant_bits).")
 
     model = g._load_model(args.checkpoint_path, args.device, precision, use_tp=False, int8_act_quant=bool(args.int8_act_quant))
     if verify_quant_bits:
-        from quantize import set_post_matmul_output_quant_bits, set_post_matmul_output_quant_clip_scale
+        from quantize import (
+            set_post_matmul_output_quant_bits,
+            set_post_matmul_output_quant_clip_scale,
+            set_post_matmul_output_quant_delta_dac_bits,
+            set_post_matmul_output_quant_delta_mode,
+        )
 
         set_post_matmul_output_quant_bits(model, int(verify_quant_bits))
+        set_post_matmul_output_quant_delta_mode(model, delta_readout=bool(args.verify_delta_readout))
+        set_post_matmul_output_quant_delta_dac_bits(model, bits=int(verify_delta_dac_quant_bits))
         if args.verify_adc_clip_scale is not None:
             set_post_matmul_output_quant_clip_scale(model, float(args.verify_adc_clip_scale))
+    elif args.verify_delta_readout:
+        raise ValueError("--verify_delta_readout requires --verify_adc_bits > 0 (or legacy --post_matmul_quant_bits).")
 
     if args.draft_dequantize_int8:
         draft_model = g._load_int8_weight_only_as_fp_model(args.draft_checkpoint_path, draft_device, precision, use_tp=False)
@@ -363,9 +409,16 @@ def main() -> None:
 
         replace_linear_fake_act_quant(draft_model)
     if draft_quant_bits:
-        from quantize import set_post_matmul_output_quant_bits, set_post_matmul_output_quant_clip_scale
+        from quantize import (
+            set_post_matmul_output_quant_bits,
+            set_post_matmul_output_quant_clip_scale,
+            set_post_matmul_output_quant_delta_dac_bits,
+            set_post_matmul_output_quant_delta_mode,
+        )
 
         set_post_matmul_output_quant_bits(draft_model, int(draft_quant_bits))
+        set_post_matmul_output_quant_delta_mode(draft_model, delta_readout=bool(args.draft_delta_readout))
+        set_post_matmul_output_quant_delta_dac_bits(draft_model, bits=int(draft_delta_dac_quant_bits))
         if args.draft_adc_clip_scale is not None:
             set_post_matmul_output_quant_clip_scale(draft_model, float(args.draft_adc_clip_scale))
 
@@ -453,7 +506,13 @@ def main() -> None:
                 "draft_fake_act_quant_int8": bool(args.draft_fake_act_quant_int8),
                 "int8_act_quant": bool(args.int8_act_quant),
                 "verify_adc_bits": int(verify_quant_bits),
+                "verify_delta_readout": bool(args.verify_delta_readout),
+                "verify_delta_dac_bits": int(verify_delta_dac_quant_bits),
+                "verify_adc_quant_domain": "delta" if bool(args.verify_delta_readout) else "absolute",
                 "draft_adc_bits": int(draft_quant_bits),
+                "draft_delta_readout": bool(args.draft_delta_readout),
+                "draft_delta_dac_bits": int(draft_delta_dac_quant_bits),
+                "draft_adc_quant_domain": "delta" if bool(args.draft_delta_readout) else "absolute",
                 "verify_adc_clip_scale": None if args.verify_adc_clip_scale is None else float(args.verify_adc_clip_scale),
                 "draft_adc_clip_scale": None if args.draft_adc_clip_scale is None else float(args.draft_adc_clip_scale),
                 "post_matmul_quant_bits": int(args.post_matmul_quant_bits),
@@ -540,7 +599,13 @@ def main() -> None:
                 "draft_fake_act_quant_int8": bool(args.draft_fake_act_quant_int8),
                 "int8_act_quant": bool(args.int8_act_quant),
                 "verify_adc_bits": int(verify_quant_bits),
+                "verify_delta_readout": bool(args.verify_delta_readout),
+                "verify_delta_dac_bits": int(verify_delta_dac_quant_bits),
+                "verify_adc_quant_domain": "delta" if bool(args.verify_delta_readout) else "absolute",
                 "draft_adc_bits": int(draft_quant_bits),
+                "draft_delta_readout": bool(args.draft_delta_readout),
+                "draft_delta_dac_bits": int(draft_delta_dac_quant_bits),
+                "draft_adc_quant_domain": "delta" if bool(args.draft_delta_readout) else "absolute",
                 "verify_adc_clip_scale": None if args.verify_adc_clip_scale is None else float(args.verify_adc_clip_scale),
                 "draft_adc_clip_scale": None if args.draft_adc_clip_scale is None else float(args.draft_adc_clip_scale),
                 "post_matmul_quant_bits": int(args.post_matmul_quant_bits),

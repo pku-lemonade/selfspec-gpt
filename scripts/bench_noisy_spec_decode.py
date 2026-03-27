@@ -12,7 +12,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import generate as g
 import model as model_lib
-from quantize import replace_linear_fake_act_quant, set_post_matmul_output_quant_bits
+from quantize import (
+    replace_linear_fake_act_quant,
+    set_post_matmul_output_quant_bits,
+    set_post_matmul_output_quant_delta_dac_bits,
+    set_post_matmul_output_quant_delta_mode,
+)
 from tokenizer import get_tokenizer, resolve_tokenizer_path
 
 DEFAULT_CUDA_DEVICE = (
@@ -131,10 +136,32 @@ def main() -> None:
         help="ADC-style interface quantization bits for the target/verify analog linear outputs. 0 disables.",
     )
     parser.add_argument(
+        "--verify_delta_readout",
+        action="store_true",
+        help="If set, quantize verify ADC outputs in predictive-delta mode against the previous reconstructed token output.",
+    )
+    parser.add_argument(
+        "--verify_delta_dac_bits",
+        type=int,
+        default=0,
+        help="Optional DAC bitwidth for the stored verify delta-readout feedback baseline. 0 keeps DAC feedback ideal/unmodeled.",
+    )
+    parser.add_argument(
         "--draft_adc_bits",
         type=int,
         default=0,
         help="ADC-style interface quantization bits for the draft analog linear outputs. 0 disables.",
+    )
+    parser.add_argument(
+        "--draft_delta_readout",
+        action="store_true",
+        help="If set, quantize draft ADC outputs in predictive-delta mode against the previous reconstructed token output.",
+    )
+    parser.add_argument(
+        "--draft_delta_dac_bits",
+        type=int,
+        default=0,
+        help="Optional DAC bitwidth for the stored draft delta-readout feedback baseline. 0 keeps DAC feedback ideal/unmodeled.",
     )
     parser.add_argument(
         "--post_matmul_quant_bits",
@@ -218,16 +245,35 @@ def main() -> None:
         legacy_bits=int(args.post_matmul_quant_bits),
         label="verify ADC/interface",
     )
+    verify_delta_dac_quant_bits = g._resolve_optional_quant_bits(
+        bits=int(args.verify_delta_dac_bits),
+        label="verify delta-readout DAC",
+    )
     draft_quant_bits = g._resolve_interface_quant_bits(
         explicit_bits=int(args.draft_adc_bits),
         legacy_bits=int(args.draft_post_matmul_quant_bits),
         label="draft ADC/interface",
     )
+    draft_delta_dac_quant_bits = g._resolve_optional_quant_bits(
+        bits=int(args.draft_delta_dac_bits),
+        label="draft delta-readout DAC",
+    )
+
+    if verify_delta_dac_quant_bits and (not args.verify_delta_readout):
+        raise ValueError("--verify_delta_dac_bits requires --verify_delta_readout.")
+    if draft_delta_dac_quant_bits and (not args.draft_delta_readout):
+        raise ValueError("--draft_delta_dac_bits requires --draft_delta_readout.")
+    if args.draft_delta_readout and (not draft_quant_bits):
+        raise ValueError("--draft_delta_readout requires --draft_adc_bits > 0 (or legacy --draft_post_matmul_quant_bits).")
 
     print(f"Loading target model on {args.device} ...")
     model = g._load_model(checkpoint_path, args.device, precision, use_tp=False, int8_act_quant=bool(args.int8_act_quant))
     if verify_quant_bits:
         set_post_matmul_output_quant_bits(model, int(verify_quant_bits))
+        set_post_matmul_output_quant_delta_mode(model, delta_readout=bool(args.verify_delta_readout))
+        set_post_matmul_output_quant_delta_dac_bits(model, bits=int(verify_delta_dac_quant_bits))
+    elif args.verify_delta_readout:
+        raise ValueError("--verify_delta_readout requires --verify_adc_bits > 0 (or legacy --post_matmul_quant_bits).")
     print(f"Loading draft model on {args.draft_device} ...")
     if args.draft_dequantize_int8:
         draft_model = g._load_int8_weight_only_as_fp_model(draft_checkpoint_path, args.draft_device, precision, use_tp=False)
@@ -237,10 +283,17 @@ def main() -> None:
         replace_linear_fake_act_quant(draft_model)
     if draft_quant_bits:
         set_post_matmul_output_quant_bits(draft_model, int(draft_quant_bits))
+        set_post_matmul_output_quant_delta_mode(draft_model, delta_readout=bool(args.draft_delta_readout))
+        set_post_matmul_output_quant_delta_dac_bits(draft_model, bits=int(draft_delta_dac_quant_bits))
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
     encoded = g.encode_tokens(tokenizer, args.prompt, bos=True, device=args.device)
     prompt_length = int(encoded.size(-1))
+
+    if (args.verify_delta_readout or args.draft_delta_readout) and args.compile:
+        print("WARNING: disabling torch.compile because delta-readout uses stateful quantization")
+        args.compile = False
+        args.compile_prefill = False
 
     if args.compile:
         print("Compiling kernels (torch.compile) ...")
