@@ -14,6 +14,180 @@ This is *NOT* intended to be a "framework" or "library" - it is intended to show
 
 For an in-depth walkthrough of what's in this codebase, see this [blog post](https://pytorch.org/blog/accelerating-generative-ai-2/).
 
+## Paper Status
+
+This repository is being used as the functional simulator for the roadmap in
+[`references/Roadmap.md`](./references/Roadmap.md).
+
+If the goal is to write the paper described by that roadmap, the required
+result categories are:
+
+1. Functional speculative-decoding accuracy / acceptance results.
+2. ADC / DAC interface-precision sweeps.
+3. Noise-tolerance and fine-tuning impact results.
+4. Layer-sensitivity / draft-allocation results.
+5. Hardware-estimator outputs:
+   tokens/s, latency, energy, area, and break-even prompt length.
+
+### What Is Already Done
+
+The following categories are already available in this repository:
+
+- Roadmap-style acceptance summaries for the current best checkpoints.
+- `k` sweeps for the main roadmap models.
+- ADC-bit sweeps for the older absolute-readout path.
+- Predictive-delta ablations for:
+  - verify-side delta readout
+  - verify DAC sensitivity
+  - draft-side delta readout
+  - draft DAC sensitivity
+- A full `k x draft_adc_bits` matrix for:
+  - verify delta readout
+  - draft delta readout
+  - `verify_adc_bits = 8`
+  - `verify_delta_dac_bits = 8`
+  - `draft_delta_dac_bits = 8`
+- Clean-target quality screens for the three main paper models.
+
+### What Is Still Missing In This Repo
+
+For the current paper scope used in this repository:
+
+- the functional-simulator side is ready enough for paper writing
+- the main paper result files are already on disk
+
+The only remaining simulator-repo work should be considered cleanup / polish:
+
+- keep the OpenSpec docs aligned with the code as delta-readout support evolves
+- optionally add more summary files or figure-generation helpers for paper plots
+
+If the hardware estimator is maintained elsewhere, then there is no major
+simulator-side blocker left in this repository for drafting the paper.
+
+## Paper Files
+
+If writing the paper now, these are the primary result files to use.
+
+### 1. High-Level Roadmap Winners
+
+- [`out/final_roadmap_model_summary.md`](./out/final_roadmap_model_summary.md)
+
+This is the best starting point for the narrative section that answers:
+
+- which checkpoint is the current winner for each model size
+- what the roadmap-style large-slice acceptance is
+- how the tuned checkpoint compares with base
+
+Supporting large-slice roadmap acceptance files:
+
+- `Qwen3-0.6B`
+  - [`out/corrected_qwen0p6b_roadmap_awpqkvout_step50_s500_flex_cuda1_20260316/stats_meta_Lprompt_64.json`](./out/corrected_qwen0p6b_roadmap_awpqkvout_step50_s500_flex_cuda1_20260316/stats_meta_Lprompt_64.json)
+  - [`out/corrected_qwen0p6b_roadmap_base_s500_flex_cuda1_20260316/stats_meta_Lprompt_64.json`](./out/corrected_qwen0p6b_roadmap_base_s500_flex_cuda1_20260316/stats_meta_Lprompt_64.json)
+- `Llama-3.2-1B`
+  - [`out/corrected_llama3p2_1b_oldtuned_targetself_write10pct_rel_s500_flex_cuda1_20260316/stats_meta_Lprompt_64.json`](./out/corrected_llama3p2_1b_oldtuned_targetself_write10pct_rel_s500_flex_cuda1_20260316/stats_meta_Lprompt_64.json)
+  - [`out/corrected_llama3p2_1b_base_write10pct_rel_s500_flex_cuda1_20260316/stats_meta_Lprompt_64.json`](./out/corrected_llama3p2_1b_base_write10pct_rel_s500_flex_cuda1_20260316/stats_meta_Lprompt_64.json)
+- `Qwen3-1.7B`
+  - [`out/corrected_qwen3_1p7b_oldtuned_targetself_write10pct_rel_s500_flex_cuda1_20260317/stats_meta_Lprompt_64.json`](./out/corrected_qwen3_1p7b_oldtuned_targetself_write10pct_rel_s500_flex_cuda1_20260317/stats_meta_Lprompt_64.json)
+
+### 2. Clean-Target Quality Screens
+
+Use these for the “the clean target has not obviously collapsed” table:
+
+- [`out/qwen0p6b_quality_screen.json`](./out/qwen0p6b_quality_screen.json)
+- [`out/llama3p2_1b_quality_screen.json`](./out/llama3p2_1b_quality_screen.json)
+- [`out/qwen3_1p7b_quality_screen.json`](./out/qwen3_1p7b_quality_screen.json)
+
+### 3. K-Sweep Result Summary
+
+Use this for the “what burst length is best?” section of the paper:
+
+- [`out/k_sweep_summary.md`](./out/k_sweep_summary.md)
+
+Primary JSON files behind that summary:
+
+- [`out/k_sweep_qwen0p6b_roadmap_s100_cuda1.json`](./out/k_sweep_qwen0p6b_roadmap_s100_cuda1.json)
+- [`out/k_sweep_llama3p2_1b_roadmap_s100_cuda1.json`](./out/k_sweep_llama3p2_1b_roadmap_s100_cuda1.json)
+- [`out/k_sweep_qwen3_1p7b_roadmap_s100_cuda1.json`](./out/k_sweep_qwen3_1p7b_roadmap_s100_cuda1.json)
+- extended `k=9..12` files:
+  - [`out/k_sweep_qwen0p6b_roadmap_s100_cuda1_k9to12.json`](./out/k_sweep_qwen0p6b_roadmap_s100_cuda1_k9to12.json)
+  - [`out/k_sweep_llama3p2_1b_roadmap_s100_cuda1_k9to12.json`](./out/k_sweep_llama3p2_1b_roadmap_s100_cuda1_k9to12.json)
+  - [`out/k_sweep_qwen3_1p7b_roadmap_s100_cuda1_k9to12.json`](./out/k_sweep_qwen3_1p7b_roadmap_s100_cuda1_k9to12.json)
+
+### 4. Absolute ADC-Bit Sweep Summary
+
+Use this for the old “no delta readout” ADC comparison baseline:
+
+- [`out/k_sweep_adc_summary.md`](./out/k_sweep_adc_summary.md)
+
+Representative supporting files:
+
+- [`out/k_sweep_qwen0p6b_best_adc4_12_s100_cuda1.json`](./out/k_sweep_qwen0p6b_best_adc4_12_s100_cuda1.json)
+- [`out/k_sweep_qwen0p6b_best_adc8_12_s100_cuda1.json`](./out/k_sweep_qwen0p6b_best_adc8_12_s100_cuda1.json)
+- [`out/k_sweep_llama3p2_1b_best_adc4_12_s100_cuda1.json`](./out/k_sweep_llama3p2_1b_best_adc4_12_s100_cuda1.json)
+- [`out/k_sweep_llama3p2_1b_best_adc8_12_s100_cuda1.json`](./out/k_sweep_llama3p2_1b_best_adc8_12_s100_cuda1.json)
+- [`out/k_sweep_qwen3_1p7b_best_adc4_12_s100_cuda1.json`](./out/k_sweep_qwen3_1p7b_best_adc4_12_s100_cuda1.json)
+- [`out/k_sweep_qwen3_1p7b_best_adc8_12_s100_cuda1.json`](./out/k_sweep_qwen3_1p7b_best_adc8_12_s100_cuda1.json)
+
+### 5. Delta-Readout ADC Summary
+
+Use this for the new “delta readout on both verify and draft, DAC fixed to 8-bit”
+section:
+
+- [`out/k_sweep_delta_adc_summary.md`](./out/k_sweep_delta_adc_summary.md)
+
+Primary matrix JSONs for the paper:
+
+- `Qwen3-0.6B`
+  - [`out/k_sweep_qwen0p6b_delta_draftadc2_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen0p6b_delta_draftadc2_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_qwen0p6b_delta_draftadc3_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen0p6b_delta_draftadc3_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_qwen0p6b_delta_draftadc4_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen0p6b_delta_draftadc4_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_qwen0p6b_delta_draftadc5_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen0p6b_delta_draftadc5_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_qwen0p6b_delta_draftadc6_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen0p6b_delta_draftadc6_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+- `Llama-3.2-1B`
+  - [`out/k_sweep_llama3p2_1b_delta_draftadc2_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_llama3p2_1b_delta_draftadc2_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_llama3p2_1b_delta_draftadc3_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_llama3p2_1b_delta_draftadc3_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_llama3p2_1b_delta_draftadc4_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_llama3p2_1b_delta_draftadc4_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_llama3p2_1b_delta_draftadc5_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_llama3p2_1b_delta_draftadc5_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_llama3p2_1b_delta_draftadc6_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_llama3p2_1b_delta_draftadc6_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+- `Qwen3-1.7B`
+  - [`out/k_sweep_qwen3_1p7b_delta_draftadc2_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen3_1p7b_delta_draftadc2_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_qwen3_1p7b_delta_draftadc3_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen3_1p7b_delta_draftadc3_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_qwen3_1p7b_delta_draftadc4_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen3_1p7b_delta_draftadc4_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_qwen3_1p7b_delta_draftadc5_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen3_1p7b_delta_draftadc5_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+  - [`out/k_sweep_qwen3_1p7b_delta_draftadc6_verifyadc8_deltadac8_draftdeltadac8_s100.json`](./out/k_sweep_qwen3_1p7b_delta_draftadc6_verifyadc8_deltadac8_draftdeltadac8_s100.json)
+
+### 6. Predictive-Delta Ablation Files
+
+Use these for the focused predictive-delta section on `Qwen3-1.7B`.
+
+Verify delta readout ablations:
+
+- baseline verify `12-bit` absolute:
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify12_absolute.json`](./out/compare_qwen3_1p7b_adc4_k5_verify12_absolute.json)
+- verify `8-bit` delta, ideal DAC:
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify8_delta.json`](./out/compare_qwen3_1p7b_adc4_k5_verify8_delta.json)
+- verify `8-bit` delta, DAC sweep:
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac2.json`](./out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac2.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac4.json`](./out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac4.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac5.json`](./out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac5.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac6.json`](./out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac6.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac7.json`](./out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac7.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac8.json`](./out/compare_qwen3_1p7b_adc4_k5_verify8_delta_dac8.json)
+
+Draft delta readout ablations:
+
+- draft `4-bit` baseline, no draft delta:
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify12_absolute.json`](./out/compare_qwen3_1p7b_adc4_k5_verify12_absolute.json)
+- draft `4-bit` with ideal draft delta:
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta.json`](./out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta.json)
+- draft `4-bit` with draft DAC sweep:
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac2.json`](./out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac2.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac4.json`](./out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac4.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac5.json`](./out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac5.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac6.json`](./out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac6.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac7.json`](./out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac7.json)
+  - [`out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac8.json`](./out/compare_qwen3_1p7b_adc4_k5_verify12_draftdelta_dac8.json)
+
 ## Supported Models
 
 ### LLaMA family

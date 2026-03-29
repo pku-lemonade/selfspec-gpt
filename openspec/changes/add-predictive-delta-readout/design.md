@@ -8,21 +8,21 @@ That means the repository can currently study "how many bits does absolute verif
 
 **Goals:**
 - Add roadmap-aligned predictive delta readout to the functional simulator.
-- Scope the first implementation to the verify/target ADC path.
-- Allow the stored verify feedback baseline to use optional DAC-side quantization.
+- Support predictive delta readout on both the verify/target ADC path and the draft ADC path.
+- Allow the stored draft/verify feedback baselines to use optional DAC-side quantization.
 - Make sequence-boundary behavior explicit so runs are reproducible and comparable.
-- Export the verify readout mode in metadata and sweep outputs.
+- Export the draft/verify readout modes in metadata and sweep outputs.
 
 **Non-Goals:**
 - Model hardware-estimator PPA changes from the added DAC path in this change.
-- Extend delta readout to draft ADC or finetuning paths in this first pass.
+- Extend delta readout to training-time finetuning paths in this change.
 - Implement the roadmap's full draft/full-precision block policy or reuse-policy matrix in this change.
 
 ## Decisions
 
 ### Decision: Model delta readout as delta-domain output quantization around the previous reconstructed output
 
-For a supported verify-side analog linear output stream, the simulator will use:
+For a supported draft-side or verify-side analog linear output stream, the simulator will use:
 
 - first token in a stream: `y_hat_0 = Q(y_0)`
 - later tokens: `y_hat_t = y_hat_{t-1} + Q(y_t - y_hat_{t-1})`
@@ -34,29 +34,33 @@ Rationale:
 - avoids an overly optimistic simulator that feeds back the ideal fp previous output
 - lets temporal locality emerge naturally from model behavior instead of being hard-coded into an "effective bits" shortcut
 
-### Decision: Keep the existing verify ADC bit knob and add an explicit mode toggle
+### Decision: Keep the existing draft/verify ADC bit knobs and add explicit mode toggles
 
-The first implementation should add a verify-side boolean flag such as `--verify_delta_readout` and keep using `--verify_adc_bits` as the physical ADC bitwidth.
+The implementation should add explicit boolean flags such as `--verify_delta_readout` and `--draft_delta_readout` while keeping `--verify_adc_bits` and `--draft_adc_bits` as the physical ADC bitwidth knobs.
 
 Rules:
 - `--verify_delta_readout` requires `--verify_adc_bits > 0`
+- `--draft_delta_readout` requires `--draft_adc_bits > 0`
 - when disabled, verify ADC behavior remains the current absolute-output path
-- `--verify_adc_clip_scale` continues to apply, but in delta mode it applies to the delta signal
+- when disabled, draft ADC behavior remains the current absolute-output path
+- `--verify_adc_clip_scale` and `--draft_adc_clip_scale` continue to apply, but in delta mode they apply to the delta signal
 
 Rationale:
 - keeps the CLI small
 - preserves replayability of existing experiments
-- makes the new behavior opt-in instead of silently changing verify ADC semantics
+- makes the new behavior opt-in instead of silently changing ADC semantics
 
 ### Decision: DAC feedback precision is modeled as optional quantization of the stored delta baseline
 
-When verify delta readout is enabled, the simulator may optionally quantize the stored previous reconstructed output before analog subtraction by using a knob such as `--verify_delta_dac_bits`.
+When draft or verify delta readout is enabled, the simulator may optionally quantize the stored previous reconstructed output before analog subtraction by using knobs such as `--verify_delta_dac_bits` and `--draft_delta_dac_bits`.
 
 Rules:
 - `--verify_delta_dac_bits = 0` keeps the DAC feedback path ideal / unmodeled
+- `--draft_delta_dac_bits = 0` keeps the DAC feedback path ideal / unmodeled
 - `--verify_delta_dac_bits > 0` requires `--verify_delta_readout`
+- `--draft_delta_dac_bits > 0` requires `--draft_delta_readout`
 - the DAC-limited baseline is used for the subtraction step, while digital reconstruction still adds back the stored previous reconstructed output
-- `--verify_adc_clip_scale` still applies only to the ADC-quantized delta signal, not to the DAC feedback baseline
+- `--verify_adc_clip_scale` and `--draft_adc_clip_scale` still apply only to the ADC-quantized delta signal, not to the DAC feedback baseline
 
 Rationale:
 - captures the roadmap's finite-DAC feedback concept without introducing a full analog circuit model
@@ -85,11 +89,15 @@ Rationale:
 Metadata and sweep outputs should record:
 
 - the configured verify ADC precision
+- the configured draft ADC precision
 - the configured verify delta-readout DAC precision
+- the configured draft delta-readout DAC precision
 - whether verify readout used absolute or predictive-delta mode
+- whether draft readout used absolute or predictive-delta mode
 
 Suggested resolved field:
 - `verify_adc_quant_domain`: `absolute` or `delta`
+- `draft_adc_quant_domain`: `absolute` or `delta`
 
 Rationale:
 - a bitwidth alone is no longer enough to reproduce simulator semantics
@@ -99,4 +107,4 @@ Rationale:
 
 - **Stateful quantization vs. `torch.compile`** → mutating per-module token state may be less compiler-friendly than the current stateless fake-quant path. Initial implementation should prioritize correctness and may need an eager fallback for delta-enabled runs.
 - **Accumulated reconstruction error** → feeding back reconstructed outputs compounds quantization error, but that is closer to the roadmap abstraction than reusing ideal fp outputs.
-- **Verify-only scope** → this first pass will not cover future draft-side full-precision blocks or training-time delta readout.
+- **Training-time scope** → this implementation does not yet add delta-readout-aware finetuning or the roadmap's draft/full precision policy matrix.
